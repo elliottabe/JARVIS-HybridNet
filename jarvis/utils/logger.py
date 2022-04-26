@@ -103,8 +103,8 @@ class AverageMeter():
     loss and accuracy.
     """
     def __init__(self):
-        self.value = 0
-        self.step = 0
+        self.value = 0.
+        self.step = 0.
 
 
     def update(self, val):
@@ -115,7 +115,7 @@ class AverageMeter():
         :type val: float
         """
         self.value += val
-        self.step += 1
+        self.step += 1.
 
 
     def read(self):
@@ -128,12 +128,12 @@ class AverageMeter():
         if self.step != 0:
             return (self.value/self.step)
         else:
-            return 0
+            return 0.
 
 
     def reset(self):
         """
         Resets metered value.
         """
-        self.value = 0
-        self.step = 0
+        self.value = 0.
+        self.step = 0.

@@ -7,7 +7,7 @@ from jarvis.utils.utils import CLIColors
 from jarvis.dataset.dataset2D import Dataset2D
 from jarvis.dataset.dataset3D import Dataset3D
 import jarvis.prediction.prediction_utils as utils
-import jarvis.visualization.visualization_utils as viz_utils
+from jarvis.utils.skeleton import get_skeleton
 
 
 def set_axes_equal(ax):
@@ -26,7 +26,8 @@ def set_axes_equal(ax):
     ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
 
 
-def	visualize_2D_sample(dataset, mode, img_idx, skeleton_preset):
+def	visualize_2D_sample(dataset, mode, img_idx):
+    fig = plt.figure()
     sample = dataset.__getitem__(img_idx)
     img = (sample[0]*dataset.cfg.DATASET.STD+dataset.cfg.DATASET.MEAN)*255
     heatmaps = sample[1]
@@ -39,22 +40,8 @@ def	visualize_2D_sample(dataset, mode, img_idx, skeleton_preset):
             img = cv2.circle(img, (int(keypoints[0,0]*3),
                         int(keypoints[0,1]*3)), 4, (255,0,0), 6)
     else:
-        colors = []
-        line_idxs = []
-        if skeleton_preset != "None":
-            colors, line_idxs = utils.get_colors_and_lines(skeleton_preset)
-            if len(colors) < dataset.cfg.KEYPOINTDETECT.NUM_JOINTS:
-                print (f'{CLIColors.FAIL}Number of keypoints in dataset does '
-                            f'not match number of keypoints in skeleton '
-                            f'preset! Using default colormap.{CLIColors.ENDC}')
-                colors = []
-                line_idxs = []
-        if len(colors) == 0:
-            cmap = matplotlib.cm.get_cmap('jet')
-            for i in range(dataset.cfg.KEYPOINTDETECT.NUM_JOINTS):
-                colors.append(((np.array(
-                cmap(float(i)/dataset.cfg.KEYPOINTDETECT.NUM_JOINTS)) *
-                            255).astype(int)[:3]).tolist())
+        colors, line_idxs = get_skeleton(dataset.cfg)
+
         keypoints = keypoints.reshape(-1,3)
         for i,keypoint in enumerate(keypoints):
             if keypoint[0] + keypoint[1] != 0:
@@ -68,26 +55,14 @@ def	visualize_2D_sample(dataset, mode, img_idx, skeleton_preset):
                             (int(keypoints[line[1]][0]*3),
                             int(keypoints[line[1]][1]*3)),
                     colors[line[1]], 1)
-    return img/255
+    plt.imshow(img/255.)
+    return fig
 
 
-def visualize_3D_sample(dataset, img_idx, skeleton_preset, azim = 0, elev = 0):
+def visualize_3D_sample(dataset, img_idx, azim = 0, elev = 0):
     colors = []
     line_idxs = []
-    if skeleton_preset != "None":
-        colors, line_idxs = utils.get_colors_and_lines(skeleton_preset)
-        if len(colors) < dataset.cfg.KEYPOINTDETECT.NUM_JOINTS:
-            print (f'{CLIColors.FAIL}Number of keypoints in dataset does '
-                        f'not match number of keypoints in skeleton '
-                        f'preset! Using default colormap.{CLIColors.ENDC}')
-            colors = []
-            line_idxs = []
-    if len(colors) == 0:
-        cmap = matplotlib.cm.get_cmap('jet')
-        for i in range(dataset.cfg.KEYPOINTDETECT.NUM_JOINTS):
-            colors.append(((np.array(
-            cmap(float(i)/dataset.cfg.KEYPOINTDETECT.NUM_JOINTS)) *
-                        255).astype(int)[:3]).tolist())
+    colors, line_idxs = get_skeleton(dataset.cfg)
     sample = dataset.__getitem__(img_idx)
     images = sample[0]
     keypoints3D = sample[1]
@@ -98,13 +73,16 @@ def visualize_3D_sample(dataset, img_idx, skeleton_preset, azim = 0, elev = 0):
     ax.azim = azim
     ax.elev = elev
     for i, point in enumerate(keypoints3D):
-        ax.scatter(point[0], point[1], point[2],
-                    color = tuple(np.array(colors[i])/255.))
+        if np.sum(point) != 0:
+            ax.scatter(point[0], point[1], point[2],
+                        color = tuple(np.array(colors[i])/255.))
     for line in line_idxs:
-        ax.plot([keypoints3D[line[0]][0], keypoints3D[line[1]][0]],
-                  [keypoints3D[line[0]][1], keypoints3D[line[1]][1]],
-                  [keypoints3D[line[0]][2], keypoints3D[line[1]][2]],
-                  color = tuple(np.array(colors[line[1]])/255.))
+        if (np.sum(keypoints3D[line[0]]) != 0
+                    and np.sum(keypoints3D[line[1]]) != 0):
+            ax.plot([keypoints3D[line[0]][0], keypoints3D[line[1]][0]],
+                      [keypoints3D[line[0]][1], keypoints3D[line[1]][1]],
+                      [keypoints3D[line[0]][2], keypoints3D[line[1]][2]],
+                      color = tuple(np.array(colors[line[1]])/255.))
     set_axes_equal(ax)
     ax.autoscale_view('tight')
     return fig
