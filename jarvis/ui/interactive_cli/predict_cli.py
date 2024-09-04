@@ -125,7 +125,7 @@ def predict_3D():
                         and x.split(".")[-1] == 'pth'))
 
     use_calib_path = inq.list_input("Use calibration that is not used in "
-                "trainingset?", choices=["Yes", "No"], default = "No")
+                "trainingset?", choices=["Yes", "No"], default = "Yes")
     if use_calib_path == "Yes":
         params.dataset_name = inq.text("Enter Calibration Path",
                     validate = lambda _, x: (os.path.isdir(x)))

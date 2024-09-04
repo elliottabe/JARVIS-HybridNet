@@ -42,6 +42,15 @@ def create_videos3D(params):
                 video_paths, make_video_index)
 
     colors, line_idxs = get_skeleton(cfg)
+
+    # use different color map
+    colors = [(255, 0, 0), (255, 0, 0), (255, 0, 0), \
+        (100, 100, 100), (100, 100, 100), (0, 255, 255), \
+        (0, 0, 255), (0, 0, 255), (0, 0, 255), (0, 0, 255), \
+        (0, 255, 0), (0, 255, 0), (0, 255, 0), (0, 255, 0), \
+        (255, 0, 255), (255, 0, 255), (255, 0, 255), \
+        (255, 255, 0), (255, 255, 0), (255, 255, 0)]
+
     data = np.genfromtxt(params.data_csv, delimiter=',')
     if np.isnan(data[0,0]):
         data = data[2:]

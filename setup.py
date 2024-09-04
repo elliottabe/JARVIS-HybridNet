@@ -20,7 +20,7 @@ setuptools.setup(
         "matplotlib",
         "tqdm",
         "yacs",
-        "ruamel.yaml",
+        "ruamel.yaml==0.17.40",
         "imgaug==0.4.0",
         "tensorboard",
         "ipywidgets",

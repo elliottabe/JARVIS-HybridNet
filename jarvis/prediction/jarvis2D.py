@@ -35,8 +35,9 @@ class JarvisPredictor2D(nn.Module):
         self.center_detect_img_size = int(self.cfg.CENTERDETECT.IMAGE_SIZE)
 
         if trt_mode == 'new':
+            print("here")
             self.compile_trt_models()
-
+            print("after_complie")
         elif trt_mode == 'previous':
             self.load_trt_models()
 
@@ -66,24 +67,34 @@ class JarvisPredictor2D(nn.Module):
         transpose2D_lib_dir = os.path.join(self.cfg.PARENT_DIR, 'libs',
                     'conv_transpose2d_converter.cpython-39-x86_64-linux-gnu.so')
         torch.ops.load_library(transpose2D_lib_dir)
+        print("after_load_library?")
 
         trt_path = os.path.join(self.cfg.PARENT_DIR, 'projects',
                     self.cfg.PROJECT_NAME, 'trt-models', 'predict2D')
         os.makedirs(trt_path, exist_ok = True)
 
         self.centerDetect = self.centerDetect.eval().cuda()
+        print("before jit trace?")
+
         traced_model = torch.jit.trace(self.centerDetect,
                     [torch.randn((1, 3, 256, 256)).to("cuda")])
+        print("after jit trace?")
+
+        print("before compile?")
+
         self.centerDetect = torch_tensorrt.compile(traced_model,
             inputs= [torch_tensorrt.Input((1, 3,
                         self.cfg.CENTERDETECT.IMAGE_SIZE,
                         self.cfg.CENTERDETECT.IMAGE_SIZE), dtype=torch.float)],
             enabled_precisions= {torch.half},
         )
+        print(transpose2D_lib_dir)
+        print("before jit save?")
+
         torch.jit.save(self.centerDetect,
                     os.path.join(trt_path, 'centerDetect.pt'))
 
-
+        print("after jit save?")
         self.keypointDetect.eval().cuda()
         traced_model = torch.jit.trace(self.keypointDetect,
                     [torch.randn((1, 3, self.bounding_box_size,

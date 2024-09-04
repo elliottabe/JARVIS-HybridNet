@@ -84,17 +84,22 @@ class JarvisPredictor3D(nn.Module):
         os.makedirs(trt_path, exist_ok = True)
 
         self.centerDetect = self.centerDetect.eval().cuda()
+        print("h0")
+
         traced_model = torch.jit.trace(self.centerDetect,
                     [torch.randn((1, 3, 256, 256)).to("cuda")])
+        print("h1")
+
         self.centerDetect = torch_tensorrt.compile(traced_model,
             inputs= [torch_tensorrt.Input((self.cfg.HYBRIDNET.NUM_CAMERAS, 3,
                         self.cfg.CENTERDETECT.IMAGE_SIZE,
                         self.cfg.CENTERDETECT.IMAGE_SIZE), dtype=torch.float)],
             enabled_precisions= {torch.half},
         )
+        print("h2")
+
         torch.jit.save(self.centerDetect,
                     os.path.join(trt_path, 'centerDetect.pt'))
-
 
         self.hybridNet.effTrack.eval().cuda()
         traced_model = torch.jit.trace(self.hybridNet.effTrack,

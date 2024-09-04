@@ -15,7 +15,6 @@ from jarvis.config.project_manager import ProjectManager
 from jarvis.utils.skeleton import get_skeleton
 import jarvis.visualization.visualization_utils as utils
 
-
 def create_videos2D(params):
     project = ProjectManager()
     if not project.load(params.project_name):
@@ -42,6 +41,10 @@ def create_videos2D(params):
                 (img_size[0],img_size[1]))
 
     colors, line_idxs = get_skeleton(cfg)
+
+    if params.project_name == 'rat6-ceiling':
+        colors = [(255, 0, 0), (0, 255, 255), (0, 0, 255), (0, 255, 0), (255, 0, 255), (255, 255, 0)]
+
     header_info = np.genfromtxt(params.data_csv, delimiter=',', dtype=str, max_rows = 2)
     points2D_all = np.genfromtxt(params.data_csv, delimiter=',')
     if header_info[1,0] == 'x':

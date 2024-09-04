@@ -35,7 +35,6 @@ def predict3D(params):
 
     jarvisPredictor = JarvisPredictor3D(cfg, params.weights_center_detect,
                 params.weights_hybridnet, params.trt_mode)
-
     reproTool = get_repro_tool(cfg, params.dataset_name)
 
     params.output_dir = os.path.join(project.parent_dir,
@@ -45,7 +44,6 @@ def predict3D(params):
 
     os.makedirs(params.output_dir, exist_ok = True)
     create_info_file(params)
-
     #create openCV video read streams
     video_paths = get_video_paths(
                 params.recording_path, reproTool)
