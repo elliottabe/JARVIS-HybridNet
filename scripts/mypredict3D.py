@@ -37,6 +37,7 @@ def mypredict3d(params, trials_frames):
                 f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}')
 
     os.makedirs(params.output_dir, exist_ok = True)
+    create_info_file(params)
     #create openCV video read streams
     video_paths = get_video_paths(
                 params.recording_path, reproTool)
@@ -133,6 +134,13 @@ def create_header(writer, cfg):
     coords.insert(0, 'frame')
     writer.writerow(joints)
     writer.writerow(coords)
+
+
+def create_info_file(params):
+    with open(os.path.join(params.output_dir, 'info.yaml'), 'w') as file:
+        yaml=YAML()
+        yaml.dump({'recording_path': params.recording_path,
+                    'dataset_name': params.dataset_name}, file)
 
 
 @click.command()
