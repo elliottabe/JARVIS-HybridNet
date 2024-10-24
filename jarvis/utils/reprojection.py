@@ -139,6 +139,7 @@ def get_repro_tool(cfg, dataset_name, device = 'cuda'):
                     cam_new_name = 'Cam' + ordered_serial[cam_order]
                     calibPaths_new[cam_new_name] = cam_new_name + ".yaml"
                 calibPaths = calibPaths_new
+
             reproTool = ReprojectionTool(dataset_name, calibPaths, device)
         else:
             print (f'{CLIColors.FAIL}Could not load reprojection Tool for'

@@ -72,7 +72,6 @@ def create_videos2D(params):
             for j,point in enumerate(points2D):
                 utils.draw_point(img_orig, point, img_size,
                         colors[j])
-
         out.write(img_orig)
         if params.progress_bar != None:
             params.progress_bar.progress(float(frame_num+1)

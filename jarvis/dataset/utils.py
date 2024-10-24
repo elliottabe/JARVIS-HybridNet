@@ -108,6 +108,7 @@ class Camera:
                     'intrinsicMatrix')
         self.distortionCoeffccients = self.get_mat_from_file(calib_path,
                     'distortionCoefficients')
+        print(self.name)
         self.cameraMatrix = np.transpose((np.concatenate((self.rotationMatrix,
                     self.position.reshape(1,3)), axis = 0)).dot(
                     self.intrinsicMatrix))
