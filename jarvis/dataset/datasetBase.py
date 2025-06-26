@@ -125,7 +125,7 @@ class BaseDataset(Dataset):
             annotations = np.append(annotations, annotation, axis=0)
             keypoint = np.array(a['keypoints']).reshape(1,
                         self.num_keypoints[0]*3)
-            keypoints =np.append(keypoints, keypoint, axis=0)
+            keypoints = np.append(keypoints, keypoint, axis=0)
 
         # transform from [x, y, w, h] to [x1, y1, x2, y2]
         annotations[:, 2] = annotations[:, 0] + annotations[:, 2]

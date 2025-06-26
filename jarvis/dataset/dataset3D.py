@@ -74,8 +74,6 @@ class Dataset3D(BaseDataset):
             self.use_idxs = [i for i,cam in enumerate(all_camera_names)
                         if cam in camera_names]
 
-
-
         for set in self.dataset['framesets']:
             keypoints3D_cam = np.zeros((cfg.KEYPOINTDETECT.NUM_JOINTS, 3))
             keypoints3D_bb = []

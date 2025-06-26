@@ -42,9 +42,8 @@ def create_videos3D(params):
                 video_paths, make_video_index)
 
     colors, line_idxs = get_skeleton(cfg)
-
     # use different color map
-    if params.project_name in ["rat_pose", "rat24_3d"]:
+    if params.project_name in ["rat_pose", "rat24_3d", "rat24_2"]:
         colors = [(255, 0, 0), (255, 0, 0), (255, 0, 0), \
             (100, 100, 100), (100, 100, 100), (0, 255, 255), \
             (0, 0, 255), (0, 0, 255), (0, 0, 255), (0, 0, 255), \

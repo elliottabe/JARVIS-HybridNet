@@ -127,8 +127,7 @@ def get_repro_tool(cfg, dataset_name, device = 'cuda'):
             for cam in data['calibrations'][calibParams]:
                 calibPaths[cam] = \
                         data['calibrations'][calibParams][cam].split("/")[-1]
-            
-            if (cfg['PROJECT_NAME'] == 'rat_pose'):
+            if (cfg['PROJECT_NAME'] in ['rat_pose', 'rat24_2']):
                 ## TODO: retrain model with correct names
                 ordered_serial = [
                     "2002496", "2002483", "2002488", "2002480", "2002489", "2002485", "2002490", "2002492", "2002479", "2002494", "2002495", "2002482", "2002481", "2002491", "2002493", "2002484", "710038"

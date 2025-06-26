@@ -66,7 +66,7 @@ class ReprojectionLayer(nn.Module):
                 centerHM[0]+self.heatmap_size-2)-centerHM[0]+self.heatmap_size-1
       val2 = torch.clamp(val2, centerHM[1]-(self.heatmap_size-1),
                 centerHM[1]+self.heatmap_size-2)-centerHM[1]+self.heatmap_size-1
-
+      
       val1 = nn.functional.interpolate(val1.permute(3,0,1,2).view(1,-1,int(
                 self.grid_size/2),int(self.grid_size/2),int(self.grid_size/2)),
                 size=(self.grid_size,self.grid_size,self.grid_size),
