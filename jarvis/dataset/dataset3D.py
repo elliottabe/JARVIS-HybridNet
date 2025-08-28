@@ -403,7 +403,7 @@ class Dataset3D(BaseDataset):
         )
         rough_bbox_suggestion = min_cube_size * 1.25
         resolution_suggestion = max(
-            1, int(np.round_(rough_bbox_suggestion / 85.0))
+            1, int(np.round(rough_bbox_suggestion / 85.0))
         )
         final_bbox_suggestion = int(
             np.ceil((min_cube_size * 1.25) / (resolution_suggestion * 4))
