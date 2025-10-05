@@ -78,9 +78,7 @@ def predict3D(params):
                 imgs_orig).cuda().float().permute(0,3,1,2)[:, [2, 1, 0]]/255.
 
         points3D_net, confidences = jarvisPredictor(imgs,
-                    reproTool.cameraMatrices.cuda(),
-                    reproTool.intrinsicMatrices.cuda(),
-                    reproTool.distortionCoefficients.cuda())
+                    reproTool.cameraMatrices.cuda())
 
         if points3D_net != None:
             row = []

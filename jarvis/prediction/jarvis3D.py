@@ -131,11 +131,8 @@ class JarvisPredictor3D(nn.Module):
 
 
 
-    def forward(self, imgs, cameraMatrices, intrinsicMatrices,
-                distortionCoefficients):
+    def forward(self, imgs, cameraMatrices):
         self.reproTool.cameraMatrices = cameraMatrices
-        self.reproTool.intrinsicMatrices = intrinsicMatrices
-        self.reproTool.distortionCoefficients = distortionCoefficients
 
         img_size = torch.tensor([imgs.shape[3], imgs.shape[2]],
                     device = torch.device('cuda'))
@@ -186,9 +183,7 @@ class JarvisPredictor3D(nn.Module):
                         img_size,
                         centerHMs.unsqueeze(0),
                         center3D.int().unsqueeze(0),
-                        cameraMatrices.unsqueeze(0),
-                        intrinsicMatrices.unsqueeze(0),
-                        distortionCoefficients.unsqueeze(0))
+                        cameraMatrices.unsqueeze(0))
         else:
             points3D = None
             confidences = None

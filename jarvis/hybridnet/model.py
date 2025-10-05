@@ -50,8 +50,7 @@ class HybridNetBackbone(nn.Module):
         self.heatmap_size = torch.cuda.IntTensor([0,0])
 
 
-    def forward(self, imgs, img_size, centerHM, center3D,cameraMatrices,
-                intrinsicMatrices, distortionCoefficients):
+    def forward(self, imgs, img_size, centerHM, center3D, cameraMatrices):
         batch_size = imgs.shape[0]
         self.heatmap_size = (img_size/2).int()
         heatmaps_batch = self.effTrack(
@@ -64,8 +63,8 @@ class HybridNetBackbone(nn.Module):
 
         heatmaps_padded = F.pad(input=heatmaps_batch,
              pad = [1,1,1,1], mode='constant', value=0.)
-        heatmaps3D = self.reproLayer(heatmaps_padded, center3D,centerHM,
-                    cameraMatrices, intrinsicMatrices, distortionCoefficients)
+        heatmaps3D = self.reproLayer(heatmaps_padded, center3D, centerHM,
+                    cameraMatrices)
         # if (self.training):
         #     heatmaps3D = self.drop_joint(heatmaps3D)
 

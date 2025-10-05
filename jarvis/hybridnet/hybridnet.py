@@ -196,8 +196,7 @@ class HybridNet:
                 center3D = data[3]
                 heatmap3D = data[4]
                 cameraMatrices = data[5]
-                intrinsicMatrices = data[6]
-                distortionCoefficients = data[7]
+                # intrinsicMatrices and distortionCoefficients no longer needed for DLT
 
                 imgs = imgs.cuda()
                 keypoints = keypoints.cuda()
@@ -205,8 +204,6 @@ class HybridNet:
                 center3D = center3D.cuda()
                 heatmap3D = heatmap3D.cuda()
                 cameraMatrices = cameraMatrices.cuda()
-                intrinsicMatrices = intrinsicMatrices.cuda()
-                distortionCoefficients = distortionCoefficients.cuda()
                 img_size = torch.tensor(self.cfg.DATASET.IMAGE_SIZE).cuda()
 
 
@@ -215,9 +212,7 @@ class HybridNet:
                                      img_size,
                                      centerHM,
                                      center3D,
-                                     cameraMatrices,
-                                     intrinsicMatrices,
-                                     distortionCoefficients)
+                                     cameraMatrices)
                 loss = self.criterion(outputs[0], heatmap3D)
                 loss = loss.mean()
 
@@ -284,8 +279,7 @@ class HybridNet:
                         center3D = data[3]
                         heatmap3D = data[4]
                         cameraMatrices = data[5]
-                        intrinsicMatrices = data[6]
-                        distortionCoefficients = data[7]
+                        # intrinsicMatrices and distortionCoefficients no longer needed for DLT
 
                         imgs = imgs.cuda()
                         keypoints = keypoints.cuda()
@@ -293,8 +287,6 @@ class HybridNet:
                         center3D = center3D.cuda()
                         heatmap3D = heatmap3D.cuda()
                         cameraMatrices = cameraMatrices.cuda()
-                        intrinsicMatrices = intrinsicMatrices.cuda()
-                        distortionCoefficients = distortionCoefficients.cuda()
                         img_size = torch.tensor(
                                     self.cfg.DATASET.IMAGE_SIZE).cuda()
 
@@ -302,9 +294,7 @@ class HybridNet:
                                              img_size,
                                              centerHM,
                                              center3D,
-                                             cameraMatrices,
-                                             intrinsicMatrices,
-                                             distortionCoefficients)
+                                             cameraMatrices)
                         loss = self.criterion(outputs[0], heatmap3D)
                         loss = loss.mean()
                         acc = 0

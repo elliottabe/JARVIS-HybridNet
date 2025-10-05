@@ -37,36 +37,27 @@ class ReprojectionLayer(nn.Module):
         self.heatmap_size = int(self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE/2+2)
 
 
-    def reprojectPoints(self, x, cameraMatrices, intrinsicMatrices,
-                distortionCoefficients, centerHM):
-      intrinsicMatrices = intrinsicMatrices.permute(1,2,0)
-      distortionCoefficients = distortionCoefficients.permute(1,2,0)
+    def reprojectPoints(self, x, cameraMatrices, centerHM):
       centerHM = centerHM.permute(1,0)
 
       ones = torch.ones([x.shape[0], x.shape[1], x.shape[2],1],
                 device=torch.device('cuda'))
       x = torch.cat((x,ones),3)
 
+      # DLT projection using 3x4 camera matrix
       partial_all = torch.matmul(x.view(1,-1,4), cameraMatrices).view(-1,
                 int(self.grid_size/2), int(self.grid_size/2),
                 int(self.grid_size/2),3).permute(1,2,3,4,0)
 
-      val1 = (partial_all[:,:,:,0] / partial_all[:,:,:,2]
-                - intrinsicMatrices[2,0])
-      val2 = (partial_all[:,:,:,1] / partial_all[:,:,:,2]
-                - intrinsicMatrices[2,1])
-      r2 = (torch.square(val1 / intrinsicMatrices[0,0])
-                + torch.square(val2 / intrinsicMatrices[1,1]))
-      distort = 1 + (distortionCoefficients[0,0] +
-                distortionCoefficients[0,1] * r2) * r2
-      val1 = val1 * distort + intrinsicMatrices[2,0]
-      val2 = val2 * distort + intrinsicMatrices[2,1]
+      # Simple perspective division for DLT
+      val1 = partial_all[:,:,:,0] / partial_all[:,:,:,2]
+      val2 = partial_all[:,:,:,1] / partial_all[:,:,:,2]
 
       val1 = torch.clamp(val1, centerHM[0]-(self.heatmap_size-1),
                 centerHM[0]+self.heatmap_size-2)-centerHM[0]+self.heatmap_size-1
       val2 = torch.clamp(val2, centerHM[1]-(self.heatmap_size-1),
                 centerHM[1]+self.heatmap_size-2)-centerHM[1]+self.heatmap_size-1
-
+      
       val1 = nn.functional.interpolate(val1.permute(3,0,1,2).view(1,-1,int(
                 self.grid_size/2),int(self.grid_size/2),int(self.grid_size/2)),
                 size=(self.grid_size,self.grid_size,self.grid_size),
@@ -83,12 +74,8 @@ class ReprojectionLayer(nn.Module):
             + (val1 / 2).int()).permute(3,0,1,2).long()
 
       return res
-
-
-    def _get_heatmap_value(self, heatmaps, grid, cameraMatrices,
-                intrinsicMatrices, distortionCoefficients, centerHM):
-        reproPoints = self.reprojectPoints(grid,cameraMatrices,
-                    intrinsicMatrices, distortionCoefficients, centerHM)
+    def _get_heatmap_value(self, heatmaps, grid, cameraMatrices, centerHM):
+        reproPoints = self.reprojectPoints(grid, cameraMatrices, centerHM)
 
         num_joints =  heatmaps.shape[0];
         num_cameras =  heatmaps.shape[1];
@@ -107,13 +94,10 @@ class ReprojectionLayer(nn.Module):
         return outs
 
 
-    def forward(self, heatmaps, center, centerHM, cameraMatrices,
-                intrinsicMatrices, distortionCoefficients):
+    def forward(self, heatmaps, center, centerHM, cameraMatrices):
         # for batch in range(heatmaps.shape[0]):
         grid = self.grid+center[0]
         heatmaps3D = self._get_heatmap_value(torch.transpose(
-                    heatmaps[0], 0,1), grid, cameraMatrices[0],
-                    intrinsicMatrices[0], distortionCoefficients[0],
-                    centerHM[0]).unsqueeze(0)
+                    heatmaps[0], 0,1), grid, cameraMatrices[0], centerHM[0]).unsqueeze(0)
 
         return heatmaps3D

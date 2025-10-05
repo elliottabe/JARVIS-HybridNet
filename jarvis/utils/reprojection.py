@@ -14,14 +14,19 @@ import torch.nn as nn
 
 
 class ReprojectionTool(nn.Module):
-    def __init__(self, root_dir = None, calib_paths = None, device = 'cuda'):
+    def __init__(self, root_dir = None, calib_paths = None, device = 'cuda', use_dlt=True):
         super(ReprojectionTool, self).__init__()
         self.device = device
+        self.use_dlt = use_dlt
+        if(self.use_dlt):
+            print("Using DLT reprojection.")
+        else:
+            print("Using perspective reprojection with distortion.")
         if calib_paths != None:
             self.cameras = {}
             for camera in calib_paths:
                 self.cameras[camera] = TorchCamera(camera,
-                            os.path.join(root_dir, calib_paths[camera]), device)
+                            os.path.join(root_dir, calib_paths[camera]), device, use_dlt=use_dlt)
             self.camera_list = [self.cameras[cam] for cam in self.cameras]
             self.num_cameras = len(self.camera_list)
             self.cameraMatrices = torch.zeros((self.num_cameras, 4,3),
@@ -46,65 +51,88 @@ class ReprojectionTool(nn.Module):
                         device = torch.device(device))
 
 
-    def reprojectPoint(self,point3D):
-        ones = torch.ones([point3D.shape[0],1],
+    def reprojectPoint(self, point3D):
+        ones = torch.ones([point3D.shape[0], 1],
                     device=torch.device(self.device))
-        point3D = torch.cat((point3D, ones),1).unsqueeze(0)
-        pointRepro = torch.matmul(point3D, self.cameraMatrices).permute(1,2,0)
-        pointRepro[:,0] = (pointRepro[:,0] / pointRepro[:,2]
-                    - self.intrinsicMatrices[:,2,0])
-        pointRepro[:,1] = (pointRepro[:,1] / pointRepro[:,2]
-                    - self.intrinsicMatrices[:,2,1])
-        r2 = (torch.square(pointRepro[:,0] / self.intrinsicMatrices[:,0,0])
-                    + torch.square(pointRepro[:,1]
-                    / self.intrinsicMatrices[:,1,1]))
-        distort = (1 + (self.distortionCoefficients[:, 0, 0]
-                    + self.distortionCoefficients[: ,0, 1]*r2)*r2)
-        pointRepro[:,0] = pointRepro[:,0]*distort+self.intrinsicMatrices[:,2,0]
-        pointRepro[:,1] = pointRepro[:,1]*distort+self.intrinsicMatrices[:,2,1]
-        pointRepro = pointRepro[:,:2].permute(0,2,1).squeeze()
+        point3D = torch.cat((point3D, ones), 1).unsqueeze(0)
+        pointRepro = torch.matmul(point3D, self.cameraMatrices).permute(1, 2, 0)
+        
+        if self.use_dlt:
+            # Simple DLT projection: divide by homogeneous coordinate
+            pointRepro[:, 0] = pointRepro[:, 0] / pointRepro[:, 2]
+            pointRepro[:, 1] = pointRepro[:, 1] / pointRepro[:, 2]
+        else:
+            # Original perspective camera with distortion
+            pointRepro[:, 0] = (pointRepro[:, 0] / pointRepro[:, 2]
+                        - self.intrinsicMatrices[:, 2, 0])
+            pointRepro[:, 1] = (pointRepro[:, 1] / pointRepro[:, 2]
+                        - self.intrinsicMatrices[:, 2, 1])
+            r2 = (torch.square(pointRepro[:, 0] / self.intrinsicMatrices[:, 0, 0])
+                        + torch.square(pointRepro[:, 1]
+                        / self.intrinsicMatrices[:, 1, 1]))
+            distort = (1 + (self.distortionCoefficients[:, 0, 0]
+                        + self.distortionCoefficients[:, 0, 1]*r2)*r2)
+            pointRepro[:, 0] = pointRepro[:, 0]*distort+self.intrinsicMatrices[:, 2, 0]
+            pointRepro[:, 1] = pointRepro[:, 1]*distort+self.intrinsicMatrices[:, 2, 1]
+        
+        pointRepro = pointRepro[:, :2].permute(0, 2, 1).squeeze()
         return pointRepro
 
 
-    def reconstructPoint(self,points, maxvals):
-        cameraMatrices = self.cameraMatrices.permute(0,2,1)
-        points[0] = (points[0]-self.intrinsicMatrices[:,2,0])
-        points[1] = (points[1]-self.intrinsicMatrices[:,2,1])
-        r2 = (torch.square(points[0] / self.intrinsicMatrices[:,0,0])
-                    + torch.square(points[1] / self.intrinsicMatrices[:,1,1]))
-        distort = (1+(self.distortionCoefficients[:, 0, 0]
-                    + self.distortionCoefficients[: ,0, 1]*r2)*r2)
-        points[0] = points[0]/distort+self.intrinsicMatrices[:,2,0]
-        points[1] = points[1]/distort+self.intrinsicMatrices[:,2,1]
-
-        A = (torch.bmm(points.permute(1,0).reshape(points.shape[1], 2, 1),
-                    cameraMatrices[:,2].reshape(cameraMatrices.shape[0], 1, 4))
-                    - cameraMatrices[:,0:2])
+    def reconstructPoint(self, points, maxvals):
+        cameraMatrices = self.cameraMatrices.permute(0, 2, 1)
+        
+        if not self.use_dlt:
+            # Undistort points for perspective camera
+            points[0] = (points[0] - self.intrinsicMatrices[:, 2, 0])
+            points[1] = (points[1] - self.intrinsicMatrices[:, 2, 1])
+            r2 = (torch.square(points[0] / self.intrinsicMatrices[:, 0, 0])
+                        + torch.square(points[1] / self.intrinsicMatrices[:, 1, 1]))
+            distort = (1 + (self.distortionCoefficients[:, 0, 0]
+                        + self.distortionCoefficients[:, 0, 1]*r2)*r2)
+            points[0] = points[0]/distort + self.intrinsicMatrices[:, 2, 0]
+            points[1] = points[1]/distort + self.intrinsicMatrices[:, 2, 1]
+        
+        # DLT triangulation: build matrix A from point-camera ray constraints
+        # For each camera: x_i × (P_i * X) = 0, which gives 2 equations per camera
+        A = (torch.bmm(points.permute(1, 0).reshape(points.shape[1], 2, 1),
+                    cameraMatrices[:, 2].reshape(cameraMatrices.shape[0], 1, 4))
+                    - cameraMatrices[:, 0:2])
         A = A * maxvals
 
-        _,_,vh = torch.linalg.svd(A.flatten(0,1))
-        V = vh.transpose(0,1)
-        X = V[:,-1]
-        X = X/X[-1]
+        _, _, vh = torch.linalg.svd(A.flatten(0, 1))
+        V = vh.transpose(0, 1)
+        X = V[:, -1]
+        X = X / X[-1]
         X = X[0:3]
         return X
 
 
 class TorchCamera(nn.Module):
-    def __init__(self, name, calib_path, device = 'cuda'):
+    def __init__(self, name, calib_path, device='cuda', use_dlt=True):
         super(TorchCamera, self).__init__()
         self.name = name
-        self.position = torch.from_numpy(self.get_mat_from_file(
-                    calib_path, 'T')).float().to(device)
-        self.rotationMatrix = torch.from_numpy(self.get_mat_from_file(
-                    calib_path, 'R')).float().to(device)
-        self.intrinsicMatrix = torch.from_numpy(self.get_mat_from_file(
-                    calib_path, 'intrinsicMatrix')).float().to(device)
-        self.distortionCoeffccients = torch.from_numpy(self.get_mat_from_file(
-                    calib_path, 'distortionCoefficients')).float().to(device)
-        self.cameraMatrix = torch.transpose(torch.matmul(
-                    torch.cat((self.rotationMatrix, self.position.reshape(1,3)),
-                    axis = 0), (self.intrinsicMatrix)), 0,1).float().to(device)
+        self.use_dlt = use_dlt
+        
+        if use_dlt:
+            # Load DLT projection matrix directly (3x4)
+            self.cameraMatrix = torch.from_numpy(self.get_mat_from_file(
+                calib_path, 'projectionMatrix')).float().to(device)
+            # Set dummy values for compatibility
+            self.intrinsicMatrix = torch.eye(3, device=device)
+            self.distortionCoeffccients = torch.zeros(1, 5, device=device)
+        else:
+            self.position = torch.from_numpy(self.get_mat_from_file(
+                        calib_path, 'T')).float().to(device)
+            self.rotationMatrix = torch.from_numpy(self.get_mat_from_file(
+                        calib_path, 'R')).float().to(device)
+            self.intrinsicMatrix = torch.from_numpy(self.get_mat_from_file(
+                        calib_path, 'intrinsicMatrix')).float().to(device)
+            self.distortionCoeffccients = torch.from_numpy(self.get_mat_from_file(
+                        calib_path, 'distortionCoefficients')).float().to(device)
+            self.cameraMatrix = torch.transpose(torch.matmul(
+                        torch.cat((self.rotationMatrix, self.position.reshape(1,3)),
+                        axis = 0), (self.intrinsicMatrix)), 0,1).float().to(device)
 
     def get_mat_from_file(self, filepath, nodeName):
         fs = cv2.FileStorage(filepath, cv2.FILE_STORAGE_READ)

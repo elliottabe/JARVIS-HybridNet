@@ -22,37 +22,21 @@ class ReprojectionTool:
                         os.path.join(root_dir, calib_paths[camera]))
         self.camera_list = [self.cameras[cam] for cam in self.cameras]
         self.num_cameras = len(self.camera_list)
+        # Only store 3x4 camera matrices for DLT projection
         self.cameraMatrices = torch.zeros(self.num_cameras, 4,3)
-        self.intrinsicMatrices = torch.zeros(self.num_cameras, 3,3)
-        self.distortionCoefficients = torch.zeros(self.num_cameras, 1,5)
         for i,cam in enumerate(self.cameras):
             self.cameraMatrices[i] =  torch.from_numpy(
                         self.cameras[cam].cameraMatrix).transpose(0,1)
-            self.intrinsicMatrices[i] = torch.from_numpy(
-                        self.cameras[cam].intrinsicMatrix)
-            self.distortionCoefficients[i] = torch.from_numpy(
-                        self.cameras[cam].distortionCoeffccients)
 
 
     def reprojectPoint(self,point3D):
         pointsRepro = np.zeros((self.num_cameras, 2))
         for i,cam in enumerate(self.camera_list):
+            # Simple DLT projection using 3x4 camera matrix
             pointRepro = cam.cameraMatrix.dot(
                         np.concatenate((point3D, np.array([1]))))
+            # Normalize by homogeneous coordinate
             pointRepro = (pointRepro/pointRepro[-1])[:2]
-            pointRepro[0] = ((pointRepro[0] - cam.intrinsicMatrix[2,0])
-                        / cam.intrinsicMatrix[0,0])
-            pointRepro[1] = ((pointRepro[1] - cam.intrinsicMatrix[2,1])
-                        / cam.intrinsicMatrix[1,1])
-            r2 = pointRepro[0]*pointRepro[0]+pointRepro[1]*pointRepro[1]
-            pointRepro[0] = pointRepro[0] * (1+cam.distortionCoeffccients[0][0]
-                        * r2 + cam.distortionCoeffccients[0][1]*r2*r2)
-            pointRepro[1] = pointRepro[1] * (1+cam.distortionCoeffccients[0][0]
-                        * r2 + cam.distortionCoeffccients[0][1]*r2*r2)
-            pointRepro[0] = (pointRepro[0] * cam.intrinsicMatrix[0,0]
-                        + cam.intrinsicMatrix[2,0])
-            pointRepro[1] = (pointRepro[1] * cam.intrinsicMatrix[1,1]
-                        + cam.intrinsicMatrix[2,1])
             pointsRepro[i] = pointRepro
         return pointsRepro
 
@@ -62,29 +46,18 @@ class ReprojectionTool:
             camsToUse = range(len(self.cameras))
         if (len(camsToUse) > 1):
             camMats = []
-            distCoeffs = []
-            intrinsicMats = []
             for i,camera in enumerate(self.cameras):
                 if i in camsToUse:
                     cam = self.cameras[camera]
                     camMats.append(cam.cameraMatrix)
-                    distCoeffs.append(cam.distortionCoeffccients)
-                    intrinsicMats.append(cam.intrinsicMatrix)
 
             pointsToUse = np.zeros((2, len(camsToUse)))
             for i,cam in enumerate(camsToUse):
-                points_distorted = points[:,cam]
-                camera = self.camera_list[cam]
-                points_undist = cv2.undistortPoints(points_distorted,
-                            camera.intrinsicMatrix.transpose(),
-                            camera.distortionCoeffccients).squeeze()
-                points_undist[0] = (points_undist[0]
-                            * camera.intrinsicMatrix[0,0]
-                            + camera.intrinsicMatrix[2,0])
-                points_undist[1] = (points_undist[1]
-                            * camera.intrinsicMatrix[1,1]
-                            + camera.intrinsicMatrix[2,1])
-                pointsToUse[:,i] = points_undist
+                # Use points directly without distortion correction
+                pointsToUse[:,i] = points[:,cam]
+            
+            # DLT triangulation: build matrix A from point-camera ray constraints
+            # For each camera: x_i × (P_i * X) = 0, which gives 2 equations per camera
             A = np.zeros((pointsToUse.shape[1]*2, 4))
             for i in range(pointsToUse.shape[1]):
                 A[2*i:2*i+2] = pointsToUse[:, i].reshape(2,1).dot(
@@ -102,16 +75,10 @@ class ReprojectionTool:
 class Camera:
     def __init__(self, name, calib_path):
         self.name = name
-        self.position = self.get_mat_from_file(calib_path, 'T')
-        self.rotationMatrix = self.get_mat_from_file(calib_path, 'R')
-        self.intrinsicMatrix = self.get_mat_from_file(calib_path,
-                    'intrinsicMatrix')
-        self.distortionCoeffccients = self.get_mat_from_file(calib_path,
-                    'distortionCoefficients')
         print(self.name)
-        self.cameraMatrix = np.transpose((np.concatenate((self.rotationMatrix,
-                    self.position.reshape(1,3)), axis = 0)).dot(
-                    self.intrinsicMatrix))
+        # Load only the 3x4 projection matrix for DLT
+        self.cameraMatrix = self.get_mat_from_file(calib_path,
+                    'projectionMatrix')
 
     def get_mat_from_file(self, filepath, nodeName):
         fs = cv2.FileStorage(filepath, cv2.FILE_STORAGE_READ)

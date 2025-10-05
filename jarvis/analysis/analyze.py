@@ -66,9 +66,7 @@ def analyze_validation_data(project_name, weights_center = 'latest',
         imgs = imgs_orig.cuda().float().permute(0,3,1,2)
 
         points3D_net, _ = jarvisPredictor(imgs,
-                    reproTool.cameraMatrices.cuda(),
-                    reproTool.intrinsicMatrices.cuda(),
-                    reproTool.distortionCoefficients.cuda())
+                    reproTool.cameraMatrices.cuda())
 
         if points3D_net != None:
             points3D_net = points3D_net[0].cpu().detach().numpy()

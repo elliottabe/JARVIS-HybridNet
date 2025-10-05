@@ -248,8 +248,6 @@ class Dataset3D(BaseDataset):
                         + np.power((keypoints3D_crop[i][2]-zz)/(exponent),2)))
         sample = [img_l, keypoints3D, centerHM, center3D, heatmap3D,
                     self.reproTools[datasetName].cameraMatrices,
-                    self.reproTools[datasetName].intrinsicMatrices,
-                    self.reproTools[datasetName].distortionCoefficients,
                                 datasetName]
 
         if not self.analysisMode:
@@ -316,9 +314,10 @@ class Normalizer(object):
         self.std = np.array([[std]])
 
     def __call__(self, sample):
-        return [(sample[0].astype(np.float32) - self.mean) / self.std,
-                 sample[1], sample[2], sample[3], sample[4], sample[5],
-                 sample[6], sample[7], sample[8]]
+        # Normalize only the images, pass through the rest
+        normalized = [(sample[0].astype(np.float32) - self.mean) / self.std]
+        normalized.extend(sample[1:])
+        return normalized
 
 
 
