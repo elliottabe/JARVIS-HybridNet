@@ -14,3 +14,4 @@ __pycache__/
 *.npy
 *.csv
 projects/
+OutFiles/

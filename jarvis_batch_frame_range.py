@@ -348,6 +348,8 @@ def run_prediction(
     weights_hybridnet="latest",
     trt_mode="off",
     n_jobs=17,
+    resume=None,
+    output_name=None,
 ):
     """
     Run 3D prediction on a single video folder.
@@ -421,15 +423,28 @@ def run_prediction(
         return None
 
     # Setup output directory in standard JARVIS location:
-    # JARVIS-HybridNet/projects/<project_name>/predictions/predictions3D/Predictions_3D_<timestamp>/
-    output_dir = os.path.join(
+    # JARVIS-HybridNet/projects/<project_name>/predictions/predictions3D/Predictions_3D_<name>/
+    pred_base = os.path.join(
         project.parent_dir,
         cfg.PROJECTS_ROOT_PATH,
         project_name,
         "predictions",
         "predictions3D",
-        f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}',
     )
+    if resume and os.path.isdir(resume):
+        output_dir = resume
+        print(f"{CLIColors.OKCYAN}Resuming from: {output_dir}{CLIColors.ENDC}")
+    elif output_name:
+        # Use provided name (e.g. SLURM job ID) — auto-resume if it already exists
+        output_dir = os.path.join(pred_base, f"Predictions_3D_{output_name}")
+        if os.path.isdir(output_dir):
+            resume = output_dir  # trigger resume logic downstream
+            print(f"{CLIColors.OKCYAN}Output dir exists, auto-resuming: {output_dir}{CLIColors.ENDC}")
+    else:
+        output_dir = os.path.join(
+            pred_base,
+            f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}',
+        )
 
     os.makedirs(output_dir, exist_ok=True)
     print(f"{CLIColors.OKGREEN}Output directory: {output_dir}{CLIColors.ENDC}")
@@ -468,12 +483,43 @@ def run_prediction(
     # Create info file (matching JARVIS format)
     create_info_file(output_dir, video_folder, calib_folder, actual_frame_start, num_frames)
 
-    # Open CSV file
-    csvfile = open(os.path.join(output_dir, "data3D.csv"), "w", newline="")
+    # Determine how many rows already exist (for resume)
+    csv_path = os.path.join(output_dir, "data3D.csv")
+    resume_frame_offset = 0
+    has_header = len(cfg.KEYPOINT_NAMES) == cfg.KEYPOINTDETECT.NUM_JOINTS
+
+    if resume and os.path.isfile(csv_path):
+        with open(csv_path, "r") as f:
+            existing_lines = sum(1 for _ in f)
+        # Subtract header rows (2 lines: joint names + coord labels)
+        header_lines = 2 if has_header else 0
+        resume_frame_offset = max(0, existing_lines - header_lines)
+        if resume_frame_offset > 0:
+            print(f"{CLIColors.OKCYAN}Found {resume_frame_offset} existing rows, "
+                  f"resuming from frame {actual_frame_start + resume_frame_offset}{CLIColors.ENDC}")
+            if resume_frame_offset >= num_frames:
+                print(f"{CLIColors.OKGREEN}Already complete ({resume_frame_offset}/{num_frames} frames). "
+                      f"Skipping.{CLIColors.ENDC}")
+                for cap in caps:
+                    cap.release()
+                return {
+                    "output_dir": output_dir,
+                    "data_csv": csv_path,
+                    "video_folder": video_folder,
+                    "calib_folder": calib_folder,
+                    "frame_start": actual_frame_start,
+                    "number_frames": num_frames,
+                }
+
+    # Open CSV file (append if resuming, write if new)
+    if resume_frame_offset > 0:
+        csvfile = open(csv_path, "a", newline="")
+    else:
+        csvfile = open(csv_path, "w", newline="")
     writer = csv.writer(csvfile, delimiter=",", quotechar='"', quoting=csv.QUOTE_MINIMAL)
 
-    # Write header if keypoint names are defined
-    if len(cfg.KEYPOINT_NAMES) == cfg.KEYPOINTDETECT.NUM_JOINTS:
+    # Write header if keypoint names are defined (only for new files)
+    if resume_frame_offset == 0 and has_header:
         create_header(writer, cfg)
 
     # Pre-allocate NaN row for gap frames
@@ -482,13 +528,17 @@ def run_prediction(
     # Pre-allocate image buffer
     imgs_orig = np.zeros((len(caps), img_size[1], img_size[0], 3)).astype(np.uint8)
 
-    # Seek to start frame
+    # Seek to the correct start frame (skip already-processed frames if resuming)
+    resume_start = actual_frame_start + resume_frame_offset
     Parallel(n_jobs=n_jobs, require="sharedmem")(
-        delayed(seek)(cap, actual_frame_start) for cap in caps
+        delayed(seek)(cap, resume_start) for cap in caps
     )
 
     # Process frames
-    for frame_num in tqdm(range(actual_frame_start, actual_frame_end + 1), desc="Predicting"):
+    for frame_num in tqdm(range(resume_start, actual_frame_end + 1),
+                          desc="Predicting",
+                          initial=resume_frame_offset,
+                          total=num_frames):
         # Check if this frame should be predicted or NaN-filled
         if predict_set is not None and frame_num not in predict_set:
             # Write NaN row and advance video readers by one frame
@@ -533,6 +583,10 @@ def run_prediction(
             for i in range(cfg.KEYPOINTDETECT.NUM_JOINTS * 4):
                 row = row + ["NaN"]
             writer.writerow(row)
+
+        # Flush every 1000 frames so data is on disk for resume
+        if (frame_num - resume_start) % 1000 == 0:
+            csvfile.flush()
 
     # Cleanup
     for cap in caps:
@@ -715,6 +769,23 @@ def main():
         help="Camera names to create visualization videos for (default: all cameras)"
     )
 
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to an existing output directory to resume from. "
+             "Skips already-completed frames based on CSV row counts."
+    )
+
+    parser.add_argument(
+        "--output_name",
+        type=str,
+        default=None,
+        help="Custom name for the output directory (e.g. SLURM job ID). "
+             "Creates Predictions_3D_<output_name>. If the directory already "
+             "exists, automatically resumes from where it left off."
+    )
+
     args = parser.parse_args()
 
     # Build list of jobs
@@ -784,6 +855,8 @@ def main():
             weights_hybridnet=args.weights_hybridnet,
             trt_mode=args.trt_mode,
             n_jobs=args.n_jobs,
+            resume=args.resume,
+            output_name=args.output_name,
         )
 
         viz_output_dir = None
