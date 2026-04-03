@@ -1,0 +1,8 @@
+{
+    "jobs": [
+             {
+            "video_folder": "/mnt/lemebel/happyhouse_102025/session6/2025_10_12_15_06_46/videos/",
+            "calib_folder": "/mnt/lemebel/happyhouse_102025/session6/2025_10_12_15_06_46/videos/calibration",
+            "frame_file": "/mnt/lemebel/courtship_frames.txt"            
+        }
+      ]}

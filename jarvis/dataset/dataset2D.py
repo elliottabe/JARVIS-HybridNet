@@ -137,35 +137,47 @@ class Dataset2D(BaseDataset):
         img = self._load_image(idx)
         bboxs, keypoints = self._load_annotations(idx)
 
-        #center_x = np.mean(np.array(keypoints[:,::3]))
-        #center_y = np.mean(np.array(keypoints[:,1::3]))
-        animal_size = np.max([bboxs[0][3]-bboxs[0][1], bboxs[0][2]-bboxs[0][0]])
-        center_y = (bboxs[0][1]+bboxs[0][3])/2
-        center_x = (bboxs[0][0]+bboxs[0][2])/2
+        # Collect centers and sizes for ALL valid animals
+        centers = []
+        animal_size = 0
+        for b in bboxs:
+            if b[4] != -1:
+                cx = (b[0] + b[2]) / 2
+                cy = (b[1] + b[3]) / 2
+                centers.append([cx, cy, 1])
+                animal_size = max(animal_size,
+                                  max(b[3] - b[1], b[2] - b[0]))
 
-        if bboxs[0][4]  != -1:
-            center = np.array([[center_x,center_y,1]])
-        else:
-            center = np.array([[0.0,0.0,1.0]])
-        keypoints = center
+        has_valid = len(centers) > 0
+        if not has_valid:
+            centers = [[0.0, 0.0, 1.0]]
+        centers = np.array(centers)
+
+        # Augment all centers together
         keypoints_iaa = KeypointsOnImage(
-                    [Keypoint(x=center[0][0], y=center[0][1])],
+                    [Keypoint(x=c[0], y=c[1]) for c in centers],
                     shape=(self.height,self.width,3))
         img, keypoints_aug = self.augpipe(image=img, keypoints = keypoints_iaa)
-        center[0][0] = keypoints_aug[0].x
-        center[0][1] = keypoints_aug[0].y
+        for i, kp in enumerate(keypoints_aug.keypoints):
+            centers[i][0] = kp.x
+            centers[i][1] = kp.y
 
-        joints = np.zeros((1,1, 3))
-        joints[0, :1, :3] = center.reshape([-1, 3])
+        # Shape (num_animals, 1_joint, 3): outer loop in HeatmapGenerator
+        # iterates over "persons", each with 1 joint on channel 0.
+        # np.maximum overlay ensures overlapping Gaussians combine correctly.
+        joints = np.zeros((len(centers), 1, 3))
+        for i, c in enumerate(centers):
+            joints[i, 0, :] = c
+
         joints_list = [[],[]]
-        if bboxs[0][4]  != -1:
+        if has_valid:
             joints_list = [joints.copy() for _ in range(2)]
         target_list = list()
         for scale_id in range(2):
             target_t = self.heatmap_generators[scale_id](joints_list[scale_id],
                         animal_size)
             target_list.append(target_t.astype(np.float32))
-        sample = [img, target_list, keypoints]
+        sample = [img, target_list, centers]
         return self.transform(sample)
 
 
