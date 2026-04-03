@@ -33,6 +33,17 @@ Usage:
         --bouts_csv /path/to/courtship_bouts_summary.csv \
         --num_animals 2 --resume /path/to/Predictions_3D_20260402-123456
 
+    Multi-GPU (2 GPUs locally):
+    python jarvis_batch_multi_animal.py --project merge_courtship_V3 \
+        --video_folder /path/to/videos --calib_folder /path/to/calib \
+        --bouts_csv /path/to/courtship_bouts_summary.csv \
+        --num_animals 2 --gpus 0 1
+
+    Multi-GPU on cluster (8 GPUs, full video):
+    python jarvis_batch_multi_animal.py --project merge_courtship_V3 \
+        --video_folder /path/to/videos --calib_folder /path/to/calib \
+        --num_animals 2 --gpus 0 1 2 3 4 5 6 7
+
 Bout CSV format (columns: fly_id, bout_idx, start_frame, end_frame):
     fly_id is the recording/session identifier (not the individual animal).
     bout_idx,start_frame,end_frame are used to define frame ranges.
@@ -59,10 +70,12 @@ Output per job:
 
 import argparse
 import csv
+import gc
 import glob
 import itertools
 import json
 import os
+import re
 import sys
 import time
 
@@ -91,9 +104,73 @@ class CLIColors:
     BOLD = '\033[1m'
 
 
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+
+
+def gpu_print(*args, gpu_id=None, **kwargs):
+    """Print with optional [GPU X] prefix; strip ANSI codes on non-tty."""
+    msg = ' '.join(str(a) for a in args)
+    if gpu_id is not None:
+        msg = f"[GPU {gpu_id}] {msg}"
+    if not sys.stdout.isatty():
+        msg = _ANSI_RE.sub('', msg)
+    kwargs.setdefault('flush', True)
+    print(msg, **kwargs)
+
+
+class ProgressLogger:
+    """Lightweight progress reporter for multi-GPU and non-tty environments.
+
+    When gpu_id is None and stdout is a tty, delegates to tqdm unchanged.
+    Otherwise prints periodic summary lines prefixed with [GPU X].
+    """
+
+    def __init__(self, iterable, desc="", total=None, gpu_id=None,
+                 report_interval=30):
+        self._iterable = iterable
+        self._desc = desc
+        self._total = total if total is not None else (
+            len(iterable) if hasattr(iterable, '__len__') else None)
+        self._gpu_id = gpu_id
+        self._interval = report_interval
+        self._use_tqdm = (gpu_id is None and sys.stdout.isatty())
+
+    def __iter__(self):
+        if self._use_tqdm:
+            yield from tqdm(self._iterable, desc=self._desc,
+                            total=self._total)
+            return
+
+        t0 = time.time()
+        last_report = t0
+        count = 0
+        gpu_print(f"{self._desc}: starting ({self._total} frames)",
+                  gpu_id=self._gpu_id)
+
+        for item in self._iterable:
+            yield item
+            count += 1
+            now = time.time()
+            if now - last_report >= self._interval:
+                elapsed = now - t0
+                fps = count / elapsed if elapsed > 0 else 0
+                pct = (count / self._total * 100) if self._total else 0
+                eta = (self._total - count) / fps if fps > 0 and self._total else 0
+                gpu_print(f"{self._desc}: {count}/{self._total} "
+                          f"({pct:.0f}%) | {fps:.1f} fps | "
+                          f"ETA {eta:.0f}s",
+                          gpu_id=self._gpu_id)
+                last_report = now
+
+        elapsed = time.time() - t0
+        fps = count / elapsed if elapsed > 0 else 0
+        gpu_print(f"{self._desc}: done ({count} frames in {elapsed:.0f}s, "
+                  f"{fps:.1f} fps)",
+                  gpu_id=self._gpu_id)
+
+
 def parse_frame_file(frame_file_path):
     """Parse a text file containing frame ranges (one per line)."""
-    import re
     frame_ranges = []
     with open(frame_file_path, "r") as f:
         for line_num, line in enumerate(f, 1):
@@ -342,25 +419,41 @@ def run_prediction(
     sam3_device="cuda",
     sam3_text_prompt="fly",
     sam3_constrain_keypoints=True,
+    sam3_chunk_size=1000,
     resume_dir=None,
+    output_dir=None,
+    gpu_id=None,
+    sam3_init_lock=None,
 ):
     """
     Run multi-animal 3D prediction on a single video folder.
 
+    Args:
+        output_dir: override output directory (used by multi-GPU dispatcher)
+        gpu_id: CUDA device index (used by multi-GPU dispatcher)
+
     Returns:
         Dict with output info, or None on failure.
     """
-    print(f"\n{CLIColors.HEADER}{'=' * 60}{CLIColors.ENDC}")
-    print(f"{CLIColors.OKBLUE}Processing: {video_folder}{CLIColors.ENDC}")
-    print(f"{CLIColors.OKCYAN}Calibration: {calib_folder}{CLIColors.ENDC}")
-    print(f"{CLIColors.OKCYAN}Num animals: {num_animals}{CLIColors.ENDC}")
-    print(f"{CLIColors.HEADER}{'=' * 60}{CLIColors.ENDC}\n")
+    if gpu_id is not None:
+        torch.cuda.set_device(gpu_id)
+
+    gpu_print(f"\n{CLIColors.HEADER}{'=' * 60}{CLIColors.ENDC}",
+              gpu_id=gpu_id)
+    gpu_print(f"{CLIColors.OKBLUE}Processing: {video_folder}{CLIColors.ENDC}",
+              gpu_id=gpu_id)
+    gpu_print(f"{CLIColors.OKCYAN}Calibration: {calib_folder}{CLIColors.ENDC}",
+              gpu_id=gpu_id)
+    gpu_print(f"{CLIColors.OKCYAN}Num animals: {num_animals}{CLIColors.ENDC}",
+              gpu_id=gpu_id)
+    gpu_print(f"{CLIColors.HEADER}{'=' * 60}{CLIColors.ENDC}\n",
+              gpu_id=gpu_id)
 
     # Load project
     project = ProjectManager()
     if not project.load(project_name):
-        print(f"{CLIColors.FAIL}Could not load project: "
-              f"{project_name}!{CLIColors.ENDC}")
+        gpu_print(f"{CLIColors.FAIL}Could not load project: "
+                  f"{project_name}!{CLIColors.ENDC}", gpu_id=gpu_id)
         return None
     cfg = project.cfg
 
@@ -381,8 +474,9 @@ def run_prediction(
 
         if intrinsic_node.empty() and projection_node.empty():
             if not os.path.isdir(jarvis_calib_folder):
-                print(f"{CLIColors.WARNING}Converting calibration files to "
-                      f"JARVIS format...{CLIColors.ENDC}")
+                gpu_print(f"{CLIColors.WARNING}Converting calibration files to "
+                          f"JARVIS format...{CLIColors.ENDC}",
+                          gpu_id=gpu_id)
                 os.makedirs(jarvis_calib_folder, exist_ok=True)
                 convert2jarviscalib(calib_folder, jarvis_calib_folder)
             calib_folder = jarvis_calib_folder
@@ -407,6 +501,7 @@ def run_prediction(
     tracker = MultiAnimalTracker(
         keypoint_names=cfg.KEYPOINT_NAMES,
         num_animals=num_animals,
+        disable_swap_check=use_sam3_mask,
     )
 
     # Load reprojection tool
@@ -415,13 +510,18 @@ def run_prediction(
         return None
 
     # Setup output directory
-    if resume_dir is not None:
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        gpu_print(f"{CLIColors.OKGREEN}Output directory: {output_dir}{CLIColors.ENDC}",
+                  gpu_id=gpu_id)
+    elif resume_dir is not None:
         output_dir = resume_dir
         if not os.path.isdir(output_dir):
-            print(f"{CLIColors.FAIL}Resume directory does not exist: "
-                  f"{output_dir}{CLIColors.ENDC}")
+            gpu_print(f"{CLIColors.FAIL}Resume directory does not exist: "
+                      f"{output_dir}{CLIColors.ENDC}", gpu_id=gpu_id)
             return None
-        print(f"{CLIColors.OKGREEN}Resuming from: {output_dir}{CLIColors.ENDC}")
+        gpu_print(f"{CLIColors.OKGREEN}Resuming from: {output_dir}{CLIColors.ENDC}",
+                  gpu_id=gpu_id)
     else:
         output_dir = os.path.join(
             project.parent_dir,
@@ -432,7 +532,8 @@ def run_prediction(
             f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}',
         )
         os.makedirs(output_dir, exist_ok=True)
-        print(f"{CLIColors.OKGREEN}Output directory: {output_dir}{CLIColors.ENDC}")
+        gpu_print(f"{CLIColors.OKGREEN}Output directory: {output_dir}{CLIColors.ENDC}",
+                  gpu_id=gpu_id)
 
     # Get video paths
     video_paths = get_video_paths(video_folder, reproTool)
@@ -450,8 +551,8 @@ def run_prediction(
             end = min(end, total_frames - 1)
             resolved_bouts.append((start, end))
         total_bout_frames = sum(e - s + 1 for s, e in resolved_bouts)
-        print(f"Bout mode: {len(resolved_bouts)} bouts, "
-              f"{total_bout_frames} frames to predict")
+        gpu_print(f"Bout mode: {len(resolved_bouts)} bouts, "
+                  f"{total_bout_frames} frames to predict", gpu_id=gpu_id)
     else:
         # Contiguous mode: single range
         if frame_end == -1:
@@ -460,8 +561,8 @@ def run_prediction(
         actual_end = min(frame_end, total_frames - 1)
         resolved_bouts = [(actual_start, actual_end)]
         total_bout_frames = actual_end - actual_start + 1
-        print(f"Processing frames {actual_start} to {actual_end} "
-              f"({total_bout_frames} frames)")
+        gpu_print(f"Processing frames {actual_start} to {actual_end} "
+                  f"({total_bout_frames} frames)", gpu_id=gpu_id)
 
     # Create info file
     if resume_dir is None:
@@ -483,8 +584,8 @@ def run_prediction(
             with open(first_csv, 'r') as f:
                 total_lines = sum(1 for _ in f)
             frames_completed = max(0, total_lines - header_rows)
-            print(f"{CLIColors.OKCYAN}Found {frames_completed} frames "
-                  f"already completed{CLIColors.ENDC}")
+            gpu_print(f"{CLIColors.OKCYAN}Found {frames_completed} frames "
+                      f"already completed{CLIColors.ENDC}", gpu_id=gpu_id)
 
     # Figure out which bouts to skip and where to resume within a bout
     bouts_to_skip = 0
@@ -500,11 +601,12 @@ def run_prediction(
                 resume_frame_offset = frames_completed - cumulative
                 break
         if bouts_to_skip > 0:
-            print(f"{CLIColors.OKCYAN}Skipping {bouts_to_skip} completed "
-                  f"bout(s){CLIColors.ENDC}")
+            gpu_print(f"{CLIColors.OKCYAN}Skipping {bouts_to_skip} completed "
+                      f"bout(s){CLIColors.ENDC}", gpu_id=gpu_id)
         if resume_frame_offset > 0:
-            print(f"{CLIColors.OKCYAN}Resuming bout {bouts_to_skip + 1} "
-                  f"from frame offset {resume_frame_offset}{CLIColors.ENDC}")
+            gpu_print(f"{CLIColors.OKCYAN}Resuming bout {bouts_to_skip + 1} "
+                      f"from frame offset {resume_frame_offset}{CLIColors.ENDC}",
+                      gpu_id=gpu_id)
 
     # Open per-animal CSV files
     fly_ids = tracker.fly_ids
@@ -532,14 +634,21 @@ def run_prediction(
     camera_matrices_cuda = reproTool.cameraMatrices.cuda()
 
     # Initialize SAM3 streaming tracker if requested
+    # When running multi-GPU, a lock serializes SAM3 full-model loading
+    # to prevent simultaneous peak memory usage from OOM-killing workers.
+    _sam3_lock_held = False
     sam3_tracker = None
     if use_sam3_mask:
-        gpu_id = 0
-        if ':' in sam3_device:
-            gpu_id = int(sam3_device.split(':')[1])
-        from jarvis.prediction.sam3_video_tracker import SAM3StreamingTracker
-        sam3_tracker = SAM3StreamingTracker(
-            gpu_id=gpu_id,
+        sam3_gpu_id = gpu_id if gpu_id is not None else 0
+        if sam3_gpu_id == 0 and ':' in sam3_device:
+            sam3_gpu_id = int(sam3_device.split(':')[1])
+        from jarvis.prediction.sam3_video_tracker import SAM3LowLatencyTracker
+        if sam3_init_lock is not None:
+            sam3_init_lock.acquire()
+            _sam3_lock_held = True
+            gpu_print("Acquired SAM3 init lock", gpu_id=gpu_id)
+        sam3_tracker = SAM3LowLatencyTracker(
+            gpu_id=sam3_gpu_id,
             text_prompt=sam3_text_prompt,
         )
 
@@ -549,8 +658,9 @@ def run_prediction(
 
         # Skip fully completed bouts on resume
         if bout_idx < bouts_to_skip:
-            print(f"Bout {bout_idx + 1}/{len(resolved_bouts)} "
-                  f"[{bout_start}-{bout_end}]: skipped (already complete)")
+            gpu_print(f"Bout {bout_idx + 1}/{len(resolved_bouts)} "
+                      f"[{bout_start}-{bout_end}]: skipped (already complete)",
+                      gpu_id=gpu_id)
             continue
 
         # Determine start offset within this bout (for partial resume)
@@ -561,35 +671,107 @@ def run_prediction(
         desc = (f"Bout {bout_idx + 1}/{len(resolved_bouts)} "
                 f"[{bout_start}-{bout_end}]")
 
-        # Set up SAM3 streaming propagation for this bout
-        bout_sam3 = None  # per-bout tracker reference (None = no SAM3)
-        if sam3_tracker is not None:
-            print(f"\n{CLIColors.OKCYAN}Starting SAM3 video propagation for "
-                  f"bout {bout_idx + 1} ({bout_len} frames, "
-                  f"{len(video_paths)} cameras)...{CLIColors.ENDC}")
-            sam3_tracker.start_bout(video_paths, bout_start, bout_len)
+        # Dict to collect masks for visualization (saved as .npz after bout)
+        mask_npz = {} if use_sam3_mask else None
+
+        # SAM3 chunking: for long bouts, re-initialize SAM3 every chunk_size
+        # frames with overlap for smooth transitions.
+        sam3_overlap = 50
+
+        def _init_sam3_chunk(chunk_video_start, chunk_len):
+            """Initialize SAM3 for a chunk. Returns tracker ref or None."""
+            if sam3_tracker is None:
+                return None
+            sam3_tracker.start_bout(
+                video_paths, chunk_video_start, chunk_len)
             detection_ok = sam3_tracker.detect_frame0(
                 num_animals=num_animals, max_retry_frames=10)
             if detection_ok:
                 sam3_tracker.assign_identities(
                     reproTool, num_animals=num_animals)
                 sam3_tracker.start_propagation()
-                bout_sam3 = sam3_tracker
-                print(f"{CLIColors.OKGREEN}SAM3 streaming propagation "
-                      f"initialized (init frame: "
-                      f"{sam3_tracker.init_frame}).{CLIColors.ENDC}")
+                return sam3_tracker
             else:
-                print(f"{CLIColors.WARNING}SAM3 detection failed for this "
-                      f"bout — falling back to mask-and-redetect."
-                      f"{CLIColors.ENDC}")
+                gpu_print(f"{CLIColors.WARNING}SAM3 detection failed for "
+                          f"chunk — falling back to mask-and-redetect."
+                          f"{CLIColors.ENDC}", gpu_id=gpu_id)
                 sam3_tracker.close()
+                return None
+
+        # Determine chunk boundaries for this bout
+        if (sam3_tracker is not None and sam3_chunk_size > 0
+                and bout_len > sam3_chunk_size):
+            # Multiple chunks needed
+            chunk_boundaries = []  # (chunk_bout_start, chunk_bout_end)
+            pos = 0
+            while pos < bout_len:
+                chunk_end = min(pos + sam3_chunk_size, bout_len)
+                chunk_boundaries.append((pos, chunk_end))
+                pos = chunk_end - sam3_overlap
+                if bout_len - pos <= sam3_overlap:
+                    break  # remaining frames too few for a new chunk
+            gpu_print(f"\n{CLIColors.OKCYAN}Bout {bout_idx + 1}: {bout_len} "
+                      f"frames → {len(chunk_boundaries)} SAM3 chunks "
+                      f"(size={sam3_chunk_size}, overlap={sam3_overlap})"
+                      f"{CLIColors.ENDC}", gpu_id=gpu_id)
+        else:
+            # Single chunk = whole bout
+            chunk_boundaries = [(0, bout_len)]
+
+        # Initialize first chunk
+        first_chunk_start, first_chunk_end = chunk_boundaries[0]
+        first_chunk_len = first_chunk_end - first_chunk_start
+        bout_sam3 = None
+        current_chunk_idx = 0
+        sam3_frame_in_chunk = 0  # tracks position within current SAM3 chunk
+
+        if sam3_tracker is not None:
+            gpu_print(f"\n{CLIColors.OKCYAN}Starting SAM3 video propagation for "
+                      f"bout {bout_idx + 1} ({bout_len} frames, "
+                      f"{len(video_paths)} cameras)"
+                      + (f" chunk 1/{len(chunk_boundaries)}"
+                         if len(chunk_boundaries) > 1 else "")
+                      + f"...{CLIColors.ENDC}", gpu_id=gpu_id)
+            bout_sam3 = _init_sam3_chunk(
+                bout_start + first_chunk_start, first_chunk_len)
+            # Release the init lock after detection (full model now freed)
+            if _sam3_lock_held:
+                sam3_init_lock.release()
+                _sam3_lock_held = False
+                gpu_print("Released SAM3 init lock", gpu_id=gpu_id)
+            if bout_sam3 is not None:
+                gpu_print(f"{CLIColors.OKGREEN}SAM3 streaming ready "
+                          f"(init frame: {sam3_tracker.init_frame})."
+                          f"{CLIColors.ENDC}", gpu_id=gpu_id)
 
         # Seek all cameras to bout start (+ offset for partial resume)
         Parallel(n_jobs=n_jobs, require="sharedmem")(
             delayed(seek)(cap, bout_start + start_offset) for cap in caps
         )
 
-        for frame_num in tqdm(range(start_offset, bout_len), desc=desc):
+        for frame_num in ProgressLogger(range(start_offset, bout_len), desc=desc, gpu_id=gpu_id):
+            # Check if we need to switch to the next SAM3 chunk
+            if (sam3_tracker is not None
+                    and current_chunk_idx + 1 < len(chunk_boundaries)):
+                next_chunk_start = chunk_boundaries[
+                    current_chunk_idx + 1][0]
+                if frame_num >= next_chunk_start:
+                    # Close current chunk and start next
+                    if bout_sam3 is not None:
+                        bout_sam3.close()
+                    current_chunk_idx += 1
+                    cs, ce = chunk_boundaries[current_chunk_idx]
+                    gpu_print(f"Starting SAM3 chunk "
+                              f"{current_chunk_idx + 1}/"
+                              f"{len(chunk_boundaries)} "
+                              f"[frames {cs}-{ce}]...",
+                              gpu_id=gpu_id)
+                    bout_sam3 = _init_sam3_chunk(
+                        bout_start + cs, ce - cs)
+                    sam3_frame_in_chunk = 0
+                    if bout_sam3 is not None:
+                        gpu_print("SAM3 chunk ready.", gpu_id=gpu_id)
+
             # Read images in parallel
             Parallel(n_jobs=n_jobs, require="sharedmem")(
                 delayed(read_images)(cap, slice_idx, imgs_orig)
@@ -608,13 +790,13 @@ def run_prediction(
             # Get SAM3 masks for this frame (streaming propagation)
             frame_masks = None
             if bout_sam3 is not None:
-                if frame_num == bout_sam3.init_frame:
+                if sam3_frame_in_chunk == bout_sam3.init_frame:
                     frame_masks = bout_sam3.get_frame0_masks(
                         num_animals=num_animals)
-                elif frame_num > bout_sam3.init_frame:
+                elif sam3_frame_in_chunk > bout_sam3.init_frame:
                     frame_masks = bout_sam3.get_next_frame(
                         num_animals=num_animals)
-                # Frames before init_frame have no masks (fallback path)
+                sam3_frame_in_chunk += 1
 
             # Run multi-animal prediction
             detections = jarvisPredictor(
@@ -625,16 +807,30 @@ def run_prediction(
             # Assign identities via tracker
             assignments = tracker.assign_identities(detections)
 
+            # Save masks for visualization (keyed by assigned identity)
+            if frame_masks is not None and mask_npz is not None:
+                # Map assigned detections back to frame_masks indices
+                for fly_id in fly_ids:
+                    det = assignments.get(fly_id)
+                    if det is not None:
+                        # Find which detection index this is
+                        for di, d in enumerate(detections):
+                            if d is det and di < len(frame_masks):
+                                fm = frame_masks[di]
+                                key = f'f{frame_num:06d}_{fly_id}'
+                                mask_npz[key] = np.packbits(
+                                    fm['masks'].numpy())
+                                break
+
             # Write results to per-animal CSVs
             for fly_id in fly_ids:
                 det = assignments.get(fly_id)
                 if det is not None and det.get('points3D') is not None:
                     points3D = det['points3D']
                     confidences = det['confidences']
-                    if points3D.dim() == 1:
-                        for fid in fly_ids:
-                            writers[fid].writerow(nan_row)
-                        break
+                    if points3D.dim() != 2:
+                        writers[fly_id].writerow(nan_row)
+                        continue
                     row = []
                     for point, conf in zip(
                         points3D.squeeze(),
@@ -645,9 +841,28 @@ def run_prediction(
                 else:
                     writers[fly_id].writerow(nan_row)
 
-        # Clean up streaming tracker for this bout
+        # Save masks for visualization
+        if mask_npz:
+            mask_path = os.path.join(
+                output_dir, f'masks_bout{bout_idx}.npz')
+            mask_npz['_meta'] = np.array([
+                img_size[1], img_size[0], len(caps)  # H, W, num_cameras
+            ])
+            np.savez_compressed(mask_path, **mask_npz)
+            gpu_print(f"Saved {len(mask_npz) - 1} mask frames to {mask_path}",
+                      gpu_id=gpu_id)
+
+        # Clean up streaming tracker and free memory for this bout
         if bout_sam3 is not None:
             bout_sam3.close()
+        del mask_npz
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Safety release if lock was never released (e.g. all bouts skipped)
+    if _sam3_lock_held:
+        sam3_init_lock.release()
+        _sam3_lock_held = False
 
     # Cleanup
     for cap in caps:
@@ -663,11 +878,23 @@ def run_prediction(
     with open(os.path.join(output_dir, 'tracking_info.json'), 'w') as f:
         json.dump(tracking_info, f, indent=2)
 
-    print(f"\n{CLIColors.OKGREEN}Tracking summary:{CLIColors.ENDC}")
-    print(f"  Frames processed: {tracking_info['frame_count']}")
-    print(f"  Swap corrections: {tracking_info['swap_corrections']}")
-    print(f"  Body sizes (EMA): {tracking_info['body_sizes']}")
-    print(f"{CLIColors.OKGREEN}Completed: {output_dir}{CLIColors.ENDC}\n")
+    gpu_print(f"\n{CLIColors.OKGREEN}Tracking summary:{CLIColors.ENDC}",
+              gpu_id=gpu_id)
+    gpu_print(f"  Frames processed: {tracking_info['frame_count']}",
+              gpu_id=gpu_id)
+    gpu_print(f"  Swap corrections: {tracking_info['swap_corrections']}",
+              gpu_id=gpu_id)
+    gpu_print(f"  Body sizes (EMA): {tracking_info['body_sizes']}",
+              gpu_id=gpu_id)
+    gpu_print(f"{CLIColors.OKGREEN}Completed: {output_dir}{CLIColors.ENDC}\n",
+              gpu_id=gpu_id)
+
+    # Collect mask file paths (one per bout)
+    mask_files = {}
+    for bi in range(len(resolved_bouts)):
+        mp = os.path.join(output_dir, f'masks_bout{bi}.npz')
+        if os.path.exists(mp):
+            mask_files[bi] = mp
 
     return {
         "output_dir": output_dir,
@@ -675,11 +902,256 @@ def run_prediction(
             fly_id: os.path.join(output_dir, f'data3D_{fly_id}.csv')
             for fly_id in fly_ids
         },
+        "mask_files": mask_files,
         "video_folder": video_folder,
         "calib_folder": calib_folder,
         "bouts": resolved_bouts,
         "total_bout_frames": total_bout_frames,
         "tracking_info": tracking_info,
+    }
+
+
+def _gpu_worker(gpu_id, kwargs, sam3_init_lock=None):
+    """Worker process for multi-GPU bout processing."""
+    try:
+        # Prevent HuggingFace tokenizer deadlock in spawned processes
+        os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+        # Give each worker its own torch.compile cache to avoid lock conflicts
+        # (SAM3 uses torch.compile extensively; concurrent compilation with a
+        # shared inductor cache causes one process to block)
+        import tempfile
+        os.environ['TORCHINDUCTOR_CACHE_DIR'] = os.path.join(
+            tempfile.gettempdir(), f'torchinductor_gpu{gpu_id}')
+        # Make prints visible immediately (spawned processes use full buffering)
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+
+        torch.cuda.set_device(gpu_id)
+        kwargs['gpu_id'] = gpu_id
+        kwargs['sam3_device'] = f'cuda:{gpu_id}'
+        kwargs['sam3_init_lock'] = sam3_init_lock
+        run_prediction(**kwargs)
+    except Exception as e:
+        # Release lock on failure so other workers don't deadlock
+        if sam3_init_lock is not None:
+            try:
+                sam3_init_lock.release()
+            except ValueError:
+                pass  # already released
+        gpu_print(f"{CLIColors.FAIL}Worker failed: {e}{CLIColors.ENDC}",
+                  gpu_id=gpu_id)
+        import traceback
+        traceback.print_exc()
+
+
+def _merge_gpu_outputs(main_output_dir, worker_dirs, all_bouts, fly_ids,
+                       header_lines=None):
+    """
+    Merge per-worker CSV and mask outputs into the main output directory.
+
+    Each worker produced CSVs and mask npz files for its subset of bouts.
+    This function concatenates them in bout order.
+    """
+    # Merge CSVs: concatenate data rows in bout order
+    for fly_id in fly_ids:
+        main_csv = os.path.join(main_output_dir, f'data3D_{fly_id}.csv')
+        with open(main_csv, 'w') as out_f:
+            # Write header from first worker
+            first_worker_csv = os.path.join(
+                worker_dirs[0], f'data3D_{fly_id}.csv')
+            if os.path.exists(first_worker_csv):
+                with open(first_worker_csv, 'r') as in_f:
+                    lines = in_f.readlines()
+                # Detect header (lines with non-numeric first field)
+                n_header = 0
+                for line in lines:
+                    first_val = line.strip().split(',')[0]
+                    try:
+                        float(first_val)
+                        break
+                    except ValueError:
+                        n_header += 1
+                        out_f.write(line)
+                # Write data from all workers in order
+                for wdir in worker_dirs:
+                    wcsv = os.path.join(wdir, f'data3D_{fly_id}.csv')
+                    if not os.path.exists(wcsv):
+                        continue
+                    with open(wcsv, 'r') as in_f:
+                        wlines = in_f.readlines()
+                    for line in wlines[n_header:]:
+                        out_f.write(line)
+
+    # Merge mask files: renumber bout indices
+    global_bout_idx = 0
+    for wdir in worker_dirs:
+        local_bout = 0
+        while True:
+            src = os.path.join(wdir, f'masks_bout{local_bout}.npz')
+            if not os.path.exists(src):
+                break
+            dst = os.path.join(main_output_dir,
+                               f'masks_bout{global_bout_idx}.npz')
+            os.rename(src, dst)
+            local_bout += 1
+            global_bout_idx += 1
+
+    # Merge tracking info
+    merged_info = {
+        'num_animals': len(fly_ids),
+        'frame_count': 0,
+        'swap_corrections': 0,
+        'fly_ids': fly_ids,
+        'body_sizes': {},
+        'initialized': True,
+        'bouts': [{'start': s, 'end': e} for s, e in all_bouts],
+    }
+    for wdir in worker_dirs:
+        info_path = os.path.join(wdir, 'tracking_info.json')
+        if os.path.exists(info_path):
+            with open(info_path, 'r') as f:
+                winfo = json.load(f)
+            merged_info['frame_count'] += winfo.get('frame_count', 0)
+            merged_info['swap_corrections'] += winfo.get(
+                'swap_corrections', 0)
+            merged_info['body_sizes'] = winfo.get('body_sizes',
+                                                   merged_info['body_sizes'])
+
+    with open(os.path.join(main_output_dir, 'tracking_info.json'), 'w') as f:
+        json.dump(merged_info, f, indent=2)
+
+    # Clean up worker directories
+    import shutil
+    for wdir in worker_dirs:
+        shutil.rmtree(wdir, ignore_errors=True)
+
+
+def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts):
+    """
+    Dispatch bout processing across multiple GPUs.
+
+    Splits bouts into groups (one per GPU), spawns a worker process per GPU,
+    and merges the results.
+    """
+    import torch.multiprocessing as mp
+
+    # Prevent tokenizer deadlock before spawning
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+    n_gpus = len(gpu_ids)
+    n_bouts = len(resolved_bouts)
+
+    # Split bouts into contiguous groups (preserves temporal order per worker)
+    bout_groups = [[] for _ in range(n_gpus)]
+    for i, bout in enumerate(resolved_bouts):
+        bout_groups[i % n_gpus].append(bout)
+
+    # Create output directory
+    project = ProjectManager()
+    project.load(common_kwargs['project_name'])
+    cfg = project.cfg
+    main_output_dir = os.path.join(
+        project.parent_dir,
+        cfg.PROJECTS_ROOT_PATH,
+        common_kwargs['project_name'],
+        "predictions",
+        "predictions3D",
+        f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}',
+    )
+    os.makedirs(main_output_dir, exist_ok=True)
+
+    # Create per-worker output directories
+    worker_dirs = []
+    for i, gpu_id in enumerate(gpu_ids):
+        if not bout_groups[i]:
+            continue
+        wdir = os.path.join(main_output_dir, f'_worker_gpu{gpu_id}')
+        os.makedirs(wdir, exist_ok=True)
+        worker_dirs.append(wdir)
+
+    # Create info file
+    total_frames = sum(e - s + 1 for s, e in resolved_bouts)
+    create_info_file(
+        main_output_dir,
+        common_kwargs['video_folder'],
+        common_kwargs['calib_folder'],
+        resolved_bouts[0][0],
+        total_frames,
+        common_kwargs.get('num_animals', 2),
+    )
+
+    print(f"\n{CLIColors.BOLD}Multi-GPU dispatch: {n_bouts} bouts across "
+          f"{n_gpus} GPUs {gpu_ids}{CLIColors.ENDC}")
+    for i, gpu_id in enumerate(gpu_ids):
+        if bout_groups[i]:
+            print(f"  GPU {gpu_id}: {len(bout_groups[i])} bouts")
+
+    # Spawn worker processes
+    # Lock serializes the heavy SAM3 full-model load+detect phase so only
+    # one worker holds the ~4 GB model in memory at a time (prevents OOM).
+    mp.set_start_method('spawn', force=True)
+    sam3_init_lock = mp.Lock()
+    processes = []
+    active_worker_dirs = []
+    for i, gpu_id in enumerate(gpu_ids):
+        if not bout_groups[i]:
+            continue
+        kwargs = dict(common_kwargs)
+        kwargs['frame_ranges'] = bout_groups[i]
+        kwargs['output_dir'] = os.path.join(
+            main_output_dir, f'_worker_gpu{gpu_id}')
+        kwargs.pop('frame_start', None)
+        kwargs.pop('frame_end', None)
+        active_worker_dirs.append(kwargs['output_dir'])
+
+        p = mp.Process(target=_gpu_worker,
+                        args=(gpu_id, kwargs, sam3_init_lock))
+        p.start()
+        processes.append((gpu_id, p))
+
+    # Wait for all workers
+    failed = []
+    for gpu_id, p in processes:
+        p.join()
+        if p.exitcode != 0:
+            failed.append(gpu_id)
+            print(f"{CLIColors.FAIL}GPU {gpu_id} worker exited with "
+                  f"code {p.exitcode}{CLIColors.ENDC}")
+
+    if failed:
+        print(f"{CLIColors.FAIL}Workers failed on GPUs: {failed}. "
+              f"Partial results in {main_output_dir}{CLIColors.ENDC}")
+        return None
+
+    # Merge outputs
+    fly_ids = [f'fly{i}' for i in range(
+        common_kwargs.get('num_animals', 2))]
+    print(f"\n{CLIColors.OKCYAN}Merging outputs from {len(active_worker_dirs)} "
+          f"workers...{CLIColors.ENDC}")
+    _merge_gpu_outputs(main_output_dir, active_worker_dirs,
+                       resolved_bouts, fly_ids)
+
+    # Collect mask files
+    mask_files = {}
+    for bi in range(len(resolved_bouts)):
+        mp_path = os.path.join(main_output_dir, f'masks_bout{bi}.npz')
+        if os.path.exists(mp_path):
+            mask_files[bi] = mp_path
+
+    print(f"{CLIColors.OKGREEN}Multi-GPU prediction complete: "
+          f"{main_output_dir}{CLIColors.ENDC}\n")
+
+    return {
+        "output_dir": main_output_dir,
+        "data_csvs": {
+            fid: os.path.join(main_output_dir, f'data3D_{fid}.csv')
+            for fid in fly_ids
+        },
+        "mask_files": mask_files,
+        "video_folder": common_kwargs['video_folder'],
+        "calib_folder": common_kwargs['calib_folder'],
+        "bouts": resolved_bouts,
+        "total_bout_frames": total_frames,
     }
 
 
@@ -779,7 +1251,7 @@ def main():
              "second GPU if memory is tight."
     )
     parser.add_argument(
-        "--sam3_text_prompt", type=str, default="fly",
+        "--sam3_text_prompt", type=str, default="insect",
         help="Text prompt for SAM3 segmentation (default: 'fly')"
     )
     parser.add_argument(
@@ -788,9 +1260,23 @@ def main():
              "not for constraining keypoint detection)"
     )
     parser.add_argument(
+        "--sam3_chunk_size", type=int, default=1000,
+        help="Max frames per SAM3 video chunk. Longer bouts are split into "
+             "overlapping chunks that each get fresh detection + propagation. "
+             "Set to 0 to disable chunking. (default: 1000)"
+    )
+    parser.add_argument(
         "--resume", type=str, default=None,
         help="Path to an existing output directory to resume from. "
              "Skips already-completed bouts based on CSV row counts."
+    )
+    parser.add_argument(
+        "--gpus", type=int, nargs="+", default=None,
+        help="GPU IDs for multi-GPU parallel processing. Each GPU processes "
+             "a subset of bouts independently. Example: --gpus 0 1 for 2 GPUs, "
+             "--gpus 0 1 2 3 4 5 6 7 for 8 GPUs on a cluster node. "
+             "For full-video mode (no --bouts_csv), the video is auto-split "
+             "into chunks, one per GPU."
     )
 
     args = parser.parse_args()
@@ -852,16 +1338,13 @@ def main():
     for i, job in enumerate(jobs):
         print(f"\n{CLIColors.BOLD}[Job {i + 1}/{total_jobs}]{CLIColors.ENDC}")
 
-        prediction_result = run_prediction(
+        common_kwargs = dict(
             project_name=args.project,
             video_folder=job["video_folder"],
             calib_folder=job["calib_folder"],
             num_animals=args.num_animals,
             suppression_radius=args.suppression_radius,
             mask_scale=args.mask_scale,
-            frame_start=job.get("frame_start", args.frame_start),
-            frame_end=job.get("frame_end", args.frame_end),
-            frame_ranges=job.get("frame_ranges", None),
             cameras_to_use=args.cameras,
             weights_center_detect=args.weights_center,
             weights_hybridnet=args.weights_hybridnet,
@@ -871,8 +1354,64 @@ def main():
             sam3_device=args.sam3_device,
             sam3_text_prompt=args.sam3_text_prompt,
             sam3_constrain_keypoints=not args.no_sam3_constrain_keypoints,
-            resume_dir=args.resume,
+            sam3_chunk_size=args.sam3_chunk_size,
         )
+
+        use_multi_gpu = args.gpus is not None and len(args.gpus) > 1
+        frame_ranges = job.get("frame_ranges", None)
+
+        if use_multi_gpu:
+            # Resolve bouts for multi-GPU splitting
+            if frame_ranges is not None and len(frame_ranges) > 0:
+                resolved = list(frame_ranges)
+            else:
+                # Full-video mode: auto-split into chunks for parallel processing
+                fs = job.get("frame_start", args.frame_start)
+                fe = job.get("frame_end", args.frame_end)
+                # Need total frame count to resolve -1
+                video_paths_tmp = sorted(glob.glob(
+                    os.path.join(job["video_folder"], "*.avi"))
+                ) or sorted(glob.glob(
+                    os.path.join(job["video_folder"], "*.mp4")))
+                if video_paths_tmp:
+                    tmp_cap = cv2.VideoCapture(video_paths_tmp[0])
+                    total_f = int(tmp_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    tmp_cap.release()
+                else:
+                    total_f = 100000
+                if fe == -1:
+                    fe = total_f - 1
+                fe = min(fe, total_f - 1)
+                # Split into N chunks (one per GPU)
+                total_len = fe - fs + 1
+                chunk_size = max(1, total_len // len(args.gpus))
+                resolved = []
+                pos = fs
+                for gi in range(len(args.gpus)):
+                    chunk_end = min(pos + chunk_size - 1, fe)
+                    if gi == len(args.gpus) - 1:
+                        chunk_end = fe  # last GPU gets remainder
+                    if pos <= fe:
+                        resolved.append((pos, chunk_end))
+                    pos = chunk_end + 1
+                print(f"Full-video auto-split: {total_len} frames → "
+                      f"{len(resolved)} chunks for {len(args.gpus)} GPUs")
+
+            prediction_result = run_prediction_multi_gpu(
+                gpu_ids=args.gpus,
+                common_kwargs=common_kwargs,
+                resolved_bouts=resolved,
+            )
+        else:
+            common_kwargs['frame_start'] = job.get(
+                "frame_start", args.frame_start)
+            common_kwargs['frame_end'] = job.get(
+                "frame_end", args.frame_end)
+            common_kwargs['frame_ranges'] = frame_ranges
+            common_kwargs['resume_dir'] = args.resume
+            if args.gpus and len(args.gpus) == 1:
+                common_kwargs['gpu_id'] = args.gpus[0]
+            prediction_result = run_prediction(**common_kwargs)
 
         viz_output_dir = None
         if prediction_result is not None and (
@@ -882,6 +1421,7 @@ def main():
                            or job.get("viz_cameras", None))
             bouts = prediction_result.get("bouts", [(0, -1)])
             data_csvs = prediction_result["data_csvs"]
+            mask_files = prediction_result.get("mask_files", {})
 
             print(f"\n{CLIColors.HEADER}Creating visualization videos..."
                   f"{CLIColors.ENDC}")
@@ -896,6 +1436,7 @@ def main():
                     frame_start=bouts[0][0],
                     number_frames=bouts[0][1] - bouts[0][0] + 1,
                     video_cam_list=viz_cameras,
+                    mask_file=mask_files.get(0),
                 )
             else:
                 # Multi-bout: create per-bout CSVs and visualize each
@@ -947,6 +1488,7 @@ def main():
                         dataset_name=job["calib_folder"],
                         frame_start=bs,
                         number_frames=bout_len,
+                        mask_file=mask_files.get(bi),
                         video_cam_list=viz_cameras,
                         output_dir=bout_viz_dir,
                     )

@@ -31,12 +31,14 @@ class MultiAnimalTracker:
     """
 
     def __init__(self, keypoint_names, num_animals=2, max_jump_mm=5.0,
-                 ema_alpha=0.05, swap_check_frames=50):
+                 ema_alpha=0.05, swap_check_frames=50,
+                 disable_swap_check=False):
         self.keypoint_names = list(keypoint_names)
         self.num_animals = num_animals
         self.max_jump_mm = max_jump_mm
         self.ema_alpha = ema_alpha
         self.swap_check_frames = swap_check_frames
+        self.disable_swap_check = disable_swap_check
 
         # Keypoint indices for body size computation
         self.antenna_base_idx = self.keypoint_names.index('Antenna_Base')
@@ -90,12 +92,15 @@ class MultiAnimalTracker:
         Waits until all N animals are detected.
         """
         if len(detections) < self.num_animals:
-            # Not enough detections to initialize -- return unassigned
+            # Not enough detections to initialize -- return sorted by body size
             self.frame_count += 1
             result = {fid: None for fid in self.fly_ids}
-            for i, det in enumerate(detections):
-                if i < len(self.fly_ids):
-                    result[self.fly_ids[i]] = det
+            sizes = [(self.compute_body_length(d['points3D']), i)
+                     for i, d in enumerate(detections)]
+            sizes.sort(reverse=True)
+            for rank, (_, det_idx) in enumerate(sizes):
+                if rank < len(self.fly_ids):
+                    result[self.fly_ids[rank]] = detections[det_idx]
             return result
 
         # Sort by body length descending (largest first = fly0)
@@ -139,10 +144,8 @@ class MultiAnimalTracker:
                 + self.ema_alpha * bl
             )
         else:
-            # Detection is too far from any known fly -- assign to closest anyway
-            if best_id is not None:
-                assignment[best_id] = detection
-                self.prev_centers[best_id] = center.clone()
+            # Detection is too far -- don't update position to avoid teleporting
+            pass
 
         self.frame_count += 1
         return assignment
@@ -169,8 +172,10 @@ class MultiAnimalTracker:
         for r, c in zip(row_ind, col_ind):
             matched[fly_ids[r]] = detections[c]
 
-        # Body size swap verification (only after EMA has stabilized)
-        if (self.frame_count > self.swap_check_frames
+        # Body size swap verification (only after EMA has stabilized,
+        # disabled when SAM3 streaming already provides identity tracking)
+        if (not self.disable_swap_check
+                and self.frame_count > self.swap_check_frames
                 and len(matched) == self.num_animals
                 and self.num_animals == 2):
             matched = self._verify_swap_two_animals(matched)

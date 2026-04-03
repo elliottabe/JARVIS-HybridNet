@@ -60,6 +60,42 @@ def load_csv_data(csv_path):
     return points3D, confidences
 
 
+def load_mask_data(mask_file):
+    """Load saved SAM3 masks from an .npz file.
+
+    Returns:
+        masks_dict: dict mapping 'f{frame:06d}_{fly_id}' -> packed bool array
+        meta: (H, W, num_cameras) tuple
+        Returns (None, None) if mask_file is None or doesn't exist.
+    """
+    if mask_file is None or not os.path.exists(mask_file):
+        return None, None
+    data = np.load(mask_file, allow_pickle=True)
+    meta_arr = data['_meta']
+    meta = (int(meta_arr[0]), int(meta_arr[1]), int(meta_arr[2]))
+    return data, meta
+
+
+def overlay_mask(img, mask, color, alpha=0.3):
+    """Overlay a binary mask as a semi-transparent colored region.
+
+    Args:
+        img: (H, W, 3) uint8 BGR image (modified in-place)
+        mask: (H, W) bool array
+        color: (B, G, R) tuple
+        alpha: transparency (0=invisible, 1=opaque)
+    """
+    if mask is None or not mask.any():
+        return
+    overlay = img.copy()
+    overlay[mask] = color
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, dst=img)
+    # Draw mask contour for crisp boundary
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(img, contours, -1, color, 1)
+
+
 def create_multi_animal_videos3D(
     project_name,
     recording_path,
@@ -71,6 +107,7 @@ def create_multi_animal_videos3D(
     fly_colors=None,
     output_dir=None,
     n_jobs=12,
+    mask_file=None,
 ):
     """
     Create visualization videos with multiple animals' skeletons overlaid.
@@ -89,6 +126,7 @@ def create_multi_animal_videos3D(
         fly_colors: optional dict mapping fly_id -> (B, G, R) color tuple
         output_dir: output directory (auto-generated if None)
         n_jobs: parallel jobs for frame reading
+        mask_file: path to .npz file with SAM3 masks (None to skip)
 
     Returns:
         output_dir path, or None on failure
@@ -142,6 +180,11 @@ def create_multi_animal_videos3D(
             print(f"  {fly_id}: {pts.shape[0]} frames loaded")
         else:
             print(f"  {fly_id}: no valid data, skipping")
+
+    # Load mask data if available
+    mask_data, mask_meta = load_mask_data(mask_file)
+    if mask_data is not None:
+        print(f"  Loaded SAM3 masks from {mask_file}")
 
     if not fly_data:
         print("No valid fly data found!")
@@ -197,6 +240,34 @@ def create_multi_animal_videos3D(
             delayed(read_images)(cap, idx, imgs_orig)
             for idx, cap in enumerate(caps)
         )
+
+        # Draw SAM3 mask overlays (before skeletons so they appear on top)
+        if mask_data is not None:
+            H_mask, W_mask, n_cams_mask = mask_meta
+            for fly_id in fly_ids:
+                key = f'f{frame_num:06d}_{fly_id}'
+                if key not in mask_data:
+                    continue
+                packed = mask_data[key]
+                masks_flat = np.unpackbits(packed)
+                total_bits = n_cams_mask * H_mask * W_mask
+                masks_bool = masks_flat[:total_bits].reshape(
+                    n_cams_mask, H_mask, W_mask).astype(bool)
+                color = fly_colors.get(fly_id, (128, 128, 128))
+                for cam_idx in range(len(outs)):
+                    if not make_video_index[cam_idx]:
+                        continue
+                    if cam_idx < n_cams_mask:
+                        cam_mask = masks_bool[cam_idx]
+                        # Resize mask if image size differs
+                        if (cam_mask.shape[0] != img_size[1]
+                                or cam_mask.shape[1] != img_size[0]):
+                            cam_mask = cv2.resize(
+                                cam_mask.astype(np.uint8),
+                                (img_size[0], img_size[1]),
+                                interpolation=cv2.INTER_NEAREST,
+                            ).astype(bool)
+                        overlay_mask(imgs_orig[cam_idx], cam_mask, color)
 
         # Draw each fly's skeleton
         for fly_id in fly_ids:

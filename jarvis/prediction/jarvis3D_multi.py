@@ -560,6 +560,9 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
             # Convert SAM3 masks to cuda tensor for keypoint constraining
             sam3_masks = fly_masks_np.cuda() if self.sam3_constrain_keypoints else None
 
+            if not torch.isfinite(center3D).all():
+                continue
+
             result = self._run_hybridnet(
                 imgs, center3D, centerHMs, cameraMatrices,
                 sam3_masks=sam3_masks,
@@ -725,6 +728,9 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
                     best_idx = dists.argmin().item()
                     sam3_masks[cam] = det['masks'][best_idx]
 
+            if not torch.isfinite(center3D).all():
+                continue
+
             result = self._run_hybridnet(
                 imgs, center3D, centerHMs, cameraMatrices,
                 sam3_masks=sam3_masks,
@@ -794,6 +800,9 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
                 centerHMs[:, 1], self.bbox_hw, img_size[1] - self.bbox_hw
             )
 
+            if not torch.isfinite(center3D).all():
+                continue
+
             result = self._run_hybridnet(
                 imgs, center3D, centerHMs, cameraMatrices,
             )
@@ -827,6 +836,9 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
 
             if center3D is None:
                 break
+
+            if not torch.isfinite(center3D).all():
+                continue
 
             result = self._run_hybridnet(
                 imgs, center3D, centerHMs, cameraMatrices,

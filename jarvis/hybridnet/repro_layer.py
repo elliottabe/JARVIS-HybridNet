@@ -87,6 +87,7 @@ class ReprojectionLayer(nn.Module):
         heatmaps = heatmaps.flatten(1);
         reproPoints = (reproPoints.flatten(1).transpose(1,0)
                     + cam_offset).transpose(1,0).flatten()
+        reproPoints = reproPoints.clamp(0, heatmaps.shape[1] - 1)
         outs = torch.mean(torch.index_select(heatmaps, 1, reproPoints).view(
                     (num_joints,num_cameras,grid_size,grid_size,grid_size)),
                     dim = 1)
