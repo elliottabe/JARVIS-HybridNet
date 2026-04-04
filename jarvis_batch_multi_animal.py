@@ -961,43 +961,139 @@ def _gpu_worker(gpu_id, kwargs, sam3_init_lock=None):
         traceback.print_exc()
 
 
+def _detect_header_rows(csv_path):
+    """Count header rows (non-numeric first field) in a CSV."""
+    n_header = 0
+    with open(csv_path, 'r') as f:
+        for line in f:
+            first_val = line.strip().split(',')[0]
+            try:
+                float(first_val)
+                break
+            except ValueError:
+                n_header += 1
+    return n_header
+
+
+def _check_worker_identity_swap(prev_worker_dir, next_worker_dir, fly_ids,
+                                n_header, n_compare=20):
+    """Compare the end of one worker with the start of the next to detect
+    identity swaps.  Uses 3D Antenna_Base position (cols 0-2) proximity.
+
+    Returns True if next_worker's fly IDs should be swapped relative to
+    prev_worker.
+    """
+    if len(fly_ids) != 2:
+        return False
+
+    def _load_endpoints(wdir, from_end, n):
+        """Load xyz for Antenna_Base (cols 0-2) from first/last n data rows."""
+        positions = {}
+        for fly_id in fly_ids:
+            csv_path = os.path.join(wdir, f'data3D_{fly_id}.csv')
+            if not os.path.exists(csv_path):
+                return None
+            data = np.genfromtxt(csv_path, delimiter=',',
+                                 skip_header=n_header)
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            if from_end:
+                chunk = data[-n:]
+            else:
+                chunk = data[:n]
+            # Average non-NaN positions
+            pts = chunk[:, 0:3]  # Antenna_Base x,y,z
+            valid = ~np.any(np.isnan(pts), axis=1)
+            if valid.sum() == 0:
+                positions[fly_id] = None
+            else:
+                positions[fly_id] = pts[valid].mean(axis=0)
+        return positions
+
+    prev_pos = _load_endpoints(prev_worker_dir, from_end=True, n=n_compare)
+    next_pos = _load_endpoints(next_worker_dir, from_end=False, n=n_compare)
+
+    if prev_pos is None or next_pos is None:
+        return False
+    if any(v is None for v in prev_pos.values()):
+        return False
+    if any(v is None for v in next_pos.values()):
+        return False
+
+    f0, f1 = fly_ids[0], fly_ids[1]
+    cost_keep = (np.linalg.norm(prev_pos[f0] - next_pos[f0])
+                 + np.linalg.norm(prev_pos[f1] - next_pos[f1]))
+    cost_swap = (np.linalg.norm(prev_pos[f0] - next_pos[f1])
+                 + np.linalg.norm(prev_pos[f1] - next_pos[f0]))
+
+    return cost_swap < cost_keep
+
+
 def _merge_gpu_outputs(main_output_dir, worker_dirs, all_bouts, fly_ids,
                        header_lines=None):
     """
     Merge per-worker CSV and mask outputs into the main output directory.
 
     Each worker produced CSVs and mask npz files for its subset of bouts.
-    This function concatenates them in bout order.
+    This function concatenates them in bout order, detecting and correcting
+    identity swaps between workers using 3D position proximity.
     """
-    # Merge CSVs: concatenate data rows in bout order
+    # Detect header size from first worker
+    first_worker_csv = os.path.join(worker_dirs[0],
+                                    f'data3D_{fly_ids[0]}.csv')
+    n_header = _detect_header_rows(first_worker_csv) if os.path.exists(
+        first_worker_csv) else 0
+
+    # Determine which workers need identity swapping.
+    # Compare raw data of adjacent workers. Since the comparison uses raw
+    # (uncorrected) files, XOR with the previous swap flag gives the
+    # cumulative correction relative to worker 0.
+    swap_flags = [False] * len(worker_dirs)
+    for wi in range(1, len(worker_dirs)):
+        raw_swap = _check_worker_identity_swap(
+            worker_dirs[wi - 1], worker_dirs[wi], fly_ids, n_header)
+        swap_flags[wi] = raw_swap ^ swap_flags[wi - 1]
+        if swap_flags[wi]:
+            print(f"{CLIColors.WARNING}  Worker {wi} ({worker_dirs[wi]}): "
+                  f"identity swap detected — correcting{CLIColors.ENDC}")
+
+    # Merge CSVs with swap correction
+    # Open all output files
+    out_files = {}
     for fly_id in fly_ids:
         main_csv = os.path.join(main_output_dir, f'data3D_{fly_id}.csv')
-        with open(main_csv, 'w') as out_f:
-            # Write header from first worker
-            first_worker_csv = os.path.join(
-                worker_dirs[0], f'data3D_{fly_id}.csv')
-            if os.path.exists(first_worker_csv):
-                with open(first_worker_csv, 'r') as in_f:
-                    lines = in_f.readlines()
-                # Detect header (lines with non-numeric first field)
-                n_header = 0
-                for line in lines:
-                    first_val = line.strip().split(',')[0]
-                    try:
-                        float(first_val)
-                        break
-                    except ValueError:
-                        n_header += 1
-                        out_f.write(line)
-                # Write data from all workers in order
-                for wdir in worker_dirs:
-                    wcsv = os.path.join(wdir, f'data3D_{fly_id}.csv')
-                    if not os.path.exists(wcsv):
-                        continue
-                    with open(wcsv, 'r') as in_f:
-                        wlines = in_f.readlines()
-                    for line in wlines[n_header:]:
-                        out_f.write(line)
+        out_files[fly_id] = open(main_csv, 'w')
+
+    # Write header from first worker
+    if os.path.exists(first_worker_csv):
+        with open(first_worker_csv, 'r') as in_f:
+            header_text = []
+            for _ in range(n_header):
+                header_text.append(in_f.readline())
+        for fly_id in fly_ids:
+            for h_line in header_text:
+                out_files[fly_id].write(h_line)
+
+    # Write data from all workers in order
+    for wi, wdir in enumerate(worker_dirs):
+        if swap_flags[wi] and len(fly_ids) == 2:
+            # Swapped: read fly0 data → write to fly1 output and vice versa
+            src_map = {fly_ids[0]: fly_ids[1], fly_ids[1]: fly_ids[0]}
+        else:
+            src_map = {fid: fid for fid in fly_ids}
+
+        for out_fly_id in fly_ids:
+            src_fly_id = src_map[out_fly_id]
+            wcsv = os.path.join(wdir, f'data3D_{src_fly_id}.csv')
+            if not os.path.exists(wcsv):
+                continue
+            with open(wcsv, 'r') as in_f:
+                wlines = in_f.readlines()
+            for line in wlines[n_header:]:
+                out_files[out_fly_id].write(line)
+
+    for f in out_files.values():
+        f.close()
 
     # Merge mask files: renumber bout indices
     global_bout_idx = 0
@@ -1083,7 +1179,7 @@ def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts,
         )
     os.makedirs(main_output_dir, exist_ok=True)
 
-    # Resume check: if prior data exists, fall back to single-GPU resume
+    # Resume check
     fly_ids = [f'fly{i}' for i in range(
         common_kwargs.get('num_animals', 2))]
     existing_csvs = [
@@ -1091,19 +1187,11 @@ def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts,
         for fid in fly_ids
     ]
     has_merged_data = all(os.path.isfile(c) for c in existing_csvs)
-    leftover_worker_dirs = sorted(
-        glob.glob(os.path.join(main_output_dir, '_worker_gpu*')))
-
-    if leftover_worker_dirs and not has_merged_data:
-        # Previous run died before merge — try merging leftover workers
-        print(f"{CLIColors.OKCYAN}Found unmerged worker dirs, "
-              f"merging...{CLIColors.ENDC}")
-        _merge_gpu_outputs(main_output_dir, leftover_worker_dirs,
-                           resolved_bouts, fly_ids)
-        has_merged_data = True
 
     if has_merged_data:
-        print(f"{CLIColors.OKCYAN}Existing data found in {main_output_dir}, "
+        # Previous run fully completed and merged — single-GPU resume on
+        # the merged CSVs (remaining work is typically small).
+        print(f"{CLIColors.OKCYAN}Merged data found in {main_output_dir}, "
               f"resuming in single-GPU mode...{CLIColors.ENDC}")
         resume_kwargs = dict(common_kwargs)
         resume_kwargs['resume_dir'] = main_output_dir
@@ -1114,28 +1202,82 @@ def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts,
         resume_kwargs['gpu_id'] = gpu_ids[0]
         return run_prediction(**resume_kwargs)
 
-    # Create per-worker output directories
+    # Detect per-worker progress from a previous run (preempted mid-work).
+    # Workers that already finished all their bouts are skipped; partially-
+    # done workers resume via the existing CSV-row-count logic.
+    use_sam3 = common_kwargs.get('use_sam3_mask', True)
+    resuming_workers = False
+
+    # Build per-worker directories and detect progress
     worker_dirs = []
+    worker_frames_done = {}  # gpu_id -> frames already written
     for i, gpu_id in enumerate(gpu_ids):
         if not bout_groups[i]:
             continue
         wdir = os.path.join(main_output_dir, f'_worker_gpu{gpu_id}')
-        os.makedirs(wdir, exist_ok=True)
         worker_dirs.append(wdir)
+        # Check if this worker has prior progress
+        first_csv = os.path.join(wdir, f'data3D_{fly_ids[0]}.csv')
+        if os.path.isfile(first_csv):
+            with open(first_csv, 'r') as f:
+                total_lines = sum(1 for _ in f)
+            # Detect header
+            header_rows = 0
+            try:
+                with open(first_csv, 'r') as f:
+                    first_line = f.readline()
+                    if first_line and not first_line[0].isdigit() and first_line[0] != '-':
+                        header_rows = 2
+            except Exception:
+                pass
+            worker_frames_done[gpu_id] = max(0, total_lines - header_rows)
+        else:
+            worker_frames_done[gpu_id] = 0
 
-    # Create info file
+    if any(v > 0 for v in worker_frames_done.values()):
+        resuming_workers = True
+        # Count expected frames per worker
+        worker_expected = {}
+        gi = 0
+        for i, gpu_id in enumerate(gpu_ids):
+            if not bout_groups[i]:
+                continue
+            worker_expected[gpu_id] = sum(
+                e - s + 1 for s, e in bout_groups[i])
+            gi += 1
+
+        for gpu_id, done in worker_frames_done.items():
+            expected = worker_expected.get(gpu_id, 0)
+            if done >= expected:
+                print(f"{CLIColors.OKCYAN}  GPU {gpu_id}: fully complete "
+                      f"({done}/{expected} frames){CLIColors.ENDC}")
+            elif done > 0:
+                print(f"{CLIColors.OKCYAN}  GPU {gpu_id}: resuming "
+                      f"({done}/{expected} frames done){CLIColors.ENDC}")
+            else:
+                print(f"  GPU {gpu_id}: starting fresh "
+                      f"({expected} frames)")
+
+    for wdir in worker_dirs:
+        os.makedirs(wdir, exist_ok=True)
+
+    # Create info file (only on first run)
     total_frames = sum(e - s + 1 for s, e in resolved_bouts)
-    create_info_file(
-        main_output_dir,
-        common_kwargs['video_folder'],
-        common_kwargs['calib_folder'],
-        resolved_bouts[0][0],
-        total_frames,
-        common_kwargs.get('num_animals', 2),
-    )
+    info_path = os.path.join(main_output_dir, 'info.cfg')
+    if not os.path.isfile(info_path):
+        create_info_file(
+            main_output_dir,
+            common_kwargs['video_folder'],
+            common_kwargs['calib_folder'],
+            resolved_bouts[0][0],
+            total_frames,
+            common_kwargs.get('num_animals', 2),
+        )
 
     print(f"\n{CLIColors.BOLD}Multi-GPU dispatch: {n_bouts} bouts across "
-          f"{n_gpus} GPUs {gpu_ids}{CLIColors.ENDC}")
+          f"{n_gpus} GPUs {gpu_ids}"
+          + (f" (resuming)" if resuming_workers else "")
+          + f"{CLIColors.ENDC}")
     for i, gpu_id in enumerate(gpu_ids):
         if bout_groups[i]:
             print(f"  GPU {gpu_id}: {len(bout_groups[i])} bouts")
@@ -1144,19 +1286,37 @@ def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts,
     # Lock serializes the heavy SAM3 full-model load+detect phase so only
     # one worker holds the ~4 GB model in memory at a time (prevents OOM).
     mp.set_start_method('spawn', force=True)
-    sam3_init_lock = mp.Lock()
+    sam3_init_lock = mp.Lock() if use_sam3 else None
     processes = []
     active_worker_dirs = []
     for i, gpu_id in enumerate(gpu_ids):
         if not bout_groups[i]:
             continue
+
+        wdir = os.path.join(main_output_dir, f'_worker_gpu{gpu_id}')
+        done = worker_frames_done.get(gpu_id, 0)
+        expected = sum(e - s + 1 for s, e in bout_groups[i])
+
+        # Skip fully-completed workers
+        if done >= expected and resuming_workers:
+            print(f"{CLIColors.OKCYAN}Skipping GPU {gpu_id} — already "
+                  f"complete{CLIColors.ENDC}")
+            active_worker_dirs.append(wdir)
+            continue
+
         kwargs = dict(common_kwargs)
         kwargs['frame_ranges'] = bout_groups[i]
-        kwargs['output_dir'] = os.path.join(
-            main_output_dir, f'_worker_gpu{gpu_id}')
         kwargs.pop('frame_start', None)
         kwargs.pop('frame_end', None)
-        active_worker_dirs.append(kwargs['output_dir'])
+
+        if done > 0 and resuming_workers:
+            # Resume: pass resume_dir so run_prediction() picks up from
+            # existing CSV progress (bout skip + partial frame offset)
+            kwargs['resume_dir'] = wdir
+        else:
+            kwargs['output_dir'] = wdir
+
+        active_worker_dirs.append(wdir)
 
         p = mp.Process(target=_gpu_worker,
                         args=(gpu_id, kwargs, sam3_init_lock))
