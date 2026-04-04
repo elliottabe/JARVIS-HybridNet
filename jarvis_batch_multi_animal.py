@@ -510,11 +510,8 @@ def run_prediction(
     if reproTool is None:
         return None
 
-    # Setup output directory
-    pred_base = os.path.join(
-        project.parent_dir, cfg.PROJECTS_ROOT_PATH,
-        project_name, "predictions", "predictions3D",
-    )
+    # Setup output directory — save alongside the recording videos
+    pred_base = video_folder
     if output_dir is not None:
         # Multi-GPU worker: directory provided by dispatcher
         pass
@@ -1156,19 +1153,22 @@ def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts,
     n_gpus = len(gpu_ids)
     n_bouts = len(resolved_bouts)
 
-    # Split bouts into contiguous groups (preserves temporal order per worker)
-    bout_groups = [[] for _ in range(n_gpus)]
-    for i, bout in enumerate(resolved_bouts):
-        bout_groups[i % n_gpus].append(bout)
+    # Split bouts into contiguous blocks so merged CSV preserves bout order.
+    # (Round-robin would interleave bouts across workers, breaking the
+    # visualization's sequential csv_offset assumption after merge.)
+    import math
+    bouts_per_gpu = math.ceil(n_bouts / n_gpus)
+    bout_groups = []
+    for gi in range(n_gpus):
+        start_idx = gi * bouts_per_gpu
+        end_idx = min(start_idx + bouts_per_gpu, n_bouts)
+        if start_idx < n_bouts:
+            bout_groups.append(list(resolved_bouts[start_idx:end_idx]))
+        else:
+            bout_groups.append([])
 
-    # Create output directory
-    project = ProjectManager()
-    project.load(common_kwargs['project_name'])
-    cfg = project.cfg
-    pred_base = os.path.join(
-        project.parent_dir, cfg.PROJECTS_ROOT_PATH,
-        common_kwargs['project_name'], "predictions", "predictions3D",
-    )
+    # Create output directory — save alongside the recording videos
+    pred_base = common_kwargs['video_folder']
     if output_name:
         main_output_dir = os.path.join(
             pred_base, f"Predictions_3D_{output_name}")
