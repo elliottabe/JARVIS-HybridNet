@@ -1498,8 +1498,17 @@ def main():
              "For full-video mode (no --bouts_csv), the video is auto-split "
              "into chunks, one per GPU."
     )
+    parser.add_argument(
+        "--num_gpus", type=int, default=None,
+        help="Number of GPUs to use (shorthand for --gpus 0 1 ... N-1). "
+             "Ignored if --gpus is also provided."
+    )
 
     args = parser.parse_args()
+
+    # Resolve --num_gpus to --gpus if needed
+    if args.gpus is None and args.num_gpus is not None:
+        args.gpus = list(range(args.num_gpus))
 
     # Build list of jobs
     jobs = []

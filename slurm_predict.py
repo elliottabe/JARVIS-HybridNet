@@ -86,7 +86,7 @@ python -u {predict_script} \\
     --calib_folder {calib_folder} \\
     --num_animals 2 \\
     --no_sam3_mask \\
-    --gpus 0 1 2 3 \\
+    --num_gpus {num_gpus} \\
     --output_name $SLURM_JOB_ID
 """
     print(f"Submitting: {recording_name}")
