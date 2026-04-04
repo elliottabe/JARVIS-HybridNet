@@ -421,6 +421,7 @@ def run_prediction(
     sam3_constrain_keypoints=True,
     sam3_chunk_size=1000,
     resume_dir=None,
+    output_name=None,
     output_dir=None,
     gpu_id=None,
     sam3_init_lock=None,
@@ -510,30 +511,32 @@ def run_prediction(
         return None
 
     # Setup output directory
+    pred_base = os.path.join(
+        project.parent_dir, cfg.PROJECTS_ROOT_PATH,
+        project_name, "predictions", "predictions3D",
+    )
     if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-        gpu_print(f"{CLIColors.OKGREEN}Output directory: {output_dir}{CLIColors.ENDC}",
-                  gpu_id=gpu_id)
-    elif resume_dir is not None:
+        # Multi-GPU worker: directory provided by dispatcher
+        pass
+    elif resume_dir is not None and os.path.isdir(resume_dir):
         output_dir = resume_dir
-        if not os.path.isdir(output_dir):
-            gpu_print(f"{CLIColors.FAIL}Resume directory does not exist: "
-                      f"{output_dir}{CLIColors.ENDC}", gpu_id=gpu_id)
-            return None
-        gpu_print(f"{CLIColors.OKGREEN}Resuming from: {output_dir}{CLIColors.ENDC}",
+        gpu_print(f"{CLIColors.OKCYAN}Resuming from: {output_dir}{CLIColors.ENDC}",
                   gpu_id=gpu_id)
+    elif output_name:
+        # Use provided name (e.g. SLURM job ID) — auto-resume if it already exists
+        output_dir = os.path.join(pred_base, f"Predictions_3D_{output_name}")
+        if os.path.isdir(output_dir):
+            resume_dir = output_dir
+            gpu_print(f"{CLIColors.OKCYAN}Output dir exists, auto-resuming: "
+                      f"{output_dir}{CLIColors.ENDC}", gpu_id=gpu_id)
     else:
         output_dir = os.path.join(
-            project.parent_dir,
-            cfg.PROJECTS_ROOT_PATH,
-            project_name,
-            "predictions",
-            "predictions3D",
+            pred_base,
             f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}',
         )
-        os.makedirs(output_dir, exist_ok=True)
-        gpu_print(f"{CLIColors.OKGREEN}Output directory: {output_dir}{CLIColors.ENDC}",
-                  gpu_id=gpu_id)
+    os.makedirs(output_dir, exist_ok=True)
+    gpu_print(f"{CLIColors.OKGREEN}Output directory: {output_dir}{CLIColors.ENDC}",
+              gpu_id=gpu_id)
 
     # Get video paths
     video_paths = get_video_paths(video_folder, reproTool)
@@ -770,6 +773,20 @@ def run_prediction(
                         bout_start + cs, ce - cs)
                     sam3_frame_in_chunk = 0
                     if bout_sam3 is not None:
+                        # Validate identity continuity with tracker state
+                        prev_centers_by_idx = {
+                            int(fid.replace('fly', '')): center
+                            for fid, center in tracker.prev_centers.items()
+                        }
+                        swapped = bout_sam3.validate_identity_continuity(
+                            prev_centers_by_idx, reproTool,
+                            num_animals=num_animals)
+                        if swapped:
+                            gpu_print(
+                                f"{CLIColors.WARNING}SAM3 identities "
+                                f"corrected at chunk boundary"
+                                f"{CLIColors.ENDC}",
+                                gpu_id=gpu_id)
                         gpu_print("SAM3 chunk ready.", gpu_id=gpu_id)
 
             # Read images in parallel
@@ -1026,12 +1043,14 @@ def _merge_gpu_outputs(main_output_dir, worker_dirs, all_bouts, fly_ids,
         shutil.rmtree(wdir, ignore_errors=True)
 
 
-def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts):
+def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts,
+                             output_name=None):
     """
     Dispatch bout processing across multiple GPUs.
 
     Splits bouts into groups (one per GPU), spawns a worker process per GPU,
-    and merges the results.
+    and merges the results. If output_name is provided, uses a deterministic
+    directory name and auto-resumes if prior data exists.
     """
     import torch.multiprocessing as mp
 
@@ -1050,15 +1069,50 @@ def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts):
     project = ProjectManager()
     project.load(common_kwargs['project_name'])
     cfg = project.cfg
-    main_output_dir = os.path.join(
-        project.parent_dir,
-        cfg.PROJECTS_ROOT_PATH,
-        common_kwargs['project_name'],
-        "predictions",
-        "predictions3D",
-        f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}',
+    pred_base = os.path.join(
+        project.parent_dir, cfg.PROJECTS_ROOT_PATH,
+        common_kwargs['project_name'], "predictions", "predictions3D",
     )
+    if output_name:
+        main_output_dir = os.path.join(
+            pred_base, f"Predictions_3D_{output_name}")
+    else:
+        main_output_dir = os.path.join(
+            pred_base,
+            f'Predictions_3D_{time.strftime("%Y%m%d-%H%M%S")}',
+        )
     os.makedirs(main_output_dir, exist_ok=True)
+
+    # Resume check: if prior data exists, fall back to single-GPU resume
+    fly_ids = [f'fly{i}' for i in range(
+        common_kwargs.get('num_animals', 2))]
+    existing_csvs = [
+        os.path.join(main_output_dir, f'data3D_{fid}.csv')
+        for fid in fly_ids
+    ]
+    has_merged_data = all(os.path.isfile(c) for c in existing_csvs)
+    leftover_worker_dirs = sorted(
+        glob.glob(os.path.join(main_output_dir, '_worker_gpu*')))
+
+    if leftover_worker_dirs and not has_merged_data:
+        # Previous run died before merge — try merging leftover workers
+        print(f"{CLIColors.OKCYAN}Found unmerged worker dirs, "
+              f"merging...{CLIColors.ENDC}")
+        _merge_gpu_outputs(main_output_dir, leftover_worker_dirs,
+                           resolved_bouts, fly_ids)
+        has_merged_data = True
+
+    if has_merged_data:
+        print(f"{CLIColors.OKCYAN}Existing data found in {main_output_dir}, "
+              f"resuming in single-GPU mode...{CLIColors.ENDC}")
+        resume_kwargs = dict(common_kwargs)
+        resume_kwargs['resume_dir'] = main_output_dir
+        resume_kwargs['output_name'] = None
+        resume_kwargs['frame_ranges'] = resolved_bouts
+        resume_kwargs.pop('frame_start', None)
+        resume_kwargs.pop('frame_end', None)
+        resume_kwargs['gpu_id'] = gpu_ids[0]
+        return run_prediction(**resume_kwargs)
 
     # Create per-worker output directories
     worker_dirs = []
@@ -1271,6 +1325,12 @@ def main():
              "Skips already-completed bouts based on CSV row counts."
     )
     parser.add_argument(
+        "--output_name", type=str, default=None,
+        help="Custom name for the output directory (e.g. SLURM job ID). "
+             "Creates Predictions_3D_<output_name>. If the directory already "
+             "exists, automatically resumes from where it left off."
+    )
+    parser.add_argument(
         "--gpus", type=int, nargs="+", default=None,
         help="GPU IDs for multi-GPU parallel processing. Each GPU processes "
              "a subset of bouts independently. Example: --gpus 0 1 for 2 GPUs, "
@@ -1355,6 +1415,7 @@ def main():
             sam3_text_prompt=args.sam3_text_prompt,
             sam3_constrain_keypoints=not args.no_sam3_constrain_keypoints,
             sam3_chunk_size=args.sam3_chunk_size,
+            output_name=args.output_name,
         )
 
         use_multi_gpu = args.gpus is not None and len(args.gpus) > 1
@@ -1397,10 +1458,13 @@ def main():
                 print(f"Full-video auto-split: {total_len} frames → "
                       f"{len(resolved)} chunks for {len(args.gpus)} GPUs")
 
+            # Pop output_name: used by dispatcher, not individual workers
+            mgpu_output_name = common_kwargs.pop('output_name', None)
             prediction_result = run_prediction_multi_gpu(
                 gpu_ids=args.gpus,
                 common_kwargs=common_kwargs,
                 resolved_bouts=resolved,
+                output_name=mgpu_output_name,
             )
         else:
             common_kwargs['frame_start'] = job.get(

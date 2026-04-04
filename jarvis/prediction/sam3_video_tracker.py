@@ -996,6 +996,78 @@ class SAM3LowLatencyTracker:
         # Fill missing fly detections on cameras via 3D reprojection
         self._fill_missing_detections(assignments, repro_tool, num_animals)
 
+    def validate_identity_continuity(self, prev_fly_centers, repro_tool,
+                                     num_animals=2):
+        """Check that identity assignments are consistent with known positions.
+
+        After a chunk transition, the fresh assign_identities() may swap
+        fly indices relative to the previous chunk.  This method triangulates
+        each fly's frame-0 position from the current identity map and compares
+        to the tracker's known 3D positions from the end of the previous chunk.
+        If swapping identities gives a better match, the identity map is
+        corrected in-place.
+
+        Args:
+            prev_fly_centers: dict {fly_idx (int): (3,) tensor} of 3D centres
+                from the MultiAnimalTracker at the end of the previous chunk.
+            repro_tool: ReprojectionTool for triangulation.
+            num_animals: number of animals (only 2-animal swap is supported).
+
+        Returns:
+            True if identities were swapped and corrected, False otherwise.
+        """
+        if num_animals != 2 or len(prev_fly_centers) < 2:
+            return False
+
+        # Triangulate each fly's frame-0 position under the current map
+        current_centers = {}
+        for fly_idx in range(num_animals):
+            pts = torch.zeros(2, self._num_cameras)
+            weights = torch.zeros(self._num_cameras, 1, 1)
+            for cam in range(self._num_cameras):
+                id_map = self._identity_map[cam]
+                frame_data = self._frame0_masks[cam]
+                for obj_id, mapped_fly in id_map.items():
+                    if mapped_fly == fly_idx and obj_id in frame_data:
+                        cx, cy = frame_data[obj_id]['centroid']
+                        pts[0, cam] = cx
+                        pts[1, cam] = cy
+                        weights[cam, 0, 0] = frame_data[obj_id]['score'] * 255
+                        break
+
+            device = repro_tool.cameraMatrices.device
+            valid = (weights[:, 0, 0] > 0).sum().item()
+            if valid >= 2:
+                center3D = repro_tool.reconstructPoint(
+                    pts.to(device), weights.to(device))
+                current_centers[fly_idx] = center3D
+
+        if len(current_centers) < 2:
+            return False
+
+        prev_0 = prev_fly_centers.get(0)
+        prev_1 = prev_fly_centers.get(1)
+        curr_0 = current_centers.get(0)
+        curr_1 = current_centers.get(1)
+        if any(x is None for x in [prev_0, prev_1, curr_0, curr_1]):
+            return False
+
+        cost_keep = (torch.norm(curr_0.cpu() - prev_0.cpu()).item()
+                     + torch.norm(curr_1.cpu() - prev_1.cpu()).item())
+        cost_swap = (torch.norm(curr_0.cpu() - prev_1.cpu()).item()
+                     + torch.norm(curr_1.cpu() - prev_0.cpu()).item())
+
+        if cost_swap < cost_keep:
+            for cam in range(self._num_cameras):
+                id_map = self._identity_map[cam]
+                for obj_id in list(id_map.keys()):
+                    if id_map[obj_id] == 0:
+                        id_map[obj_id] = 1
+                    elif id_map[obj_id] == 1:
+                        id_map[obj_id] = 0
+            return True
+        return False
+
     def _fill_missing_detections(self, assignments, repro_tool, num_animals):
         """For cameras missing a fly, create a synthetic mask from 3D reprojection.
 
