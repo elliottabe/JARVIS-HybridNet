@@ -47,7 +47,8 @@ def submit_predict(
     nodelist_line = f"#SBATCH --nodelist={gpu_resource}" if gpu_resource else ""
 
     jarvis_root = os.path.dirname(os.path.abspath(__file__))
-    predict_script = os.path.join(jarvis_root, "jarvis_batch_frame_range.py")
+    # predict_script = os.path.join(jarvis_root, "jarvis_batch_frame_range.py")
+    predict_script = os.path.join(jarvis_root, "jarvis_batch_multi_animal.py")
 
     # Derive a short name from the recording folder
     recording_name = os.path.basename(video_folder.rstrip("/"))
@@ -83,6 +84,9 @@ python -u {predict_script} \\
     --project {project} \\
     --video_folder {video_folder} \\
     --calib_folder {calib_folder} \\
+    --num_animals 2 \\
+    --no_sam3_mask \\
+    --gpus 0 1 2 3 \\
     --output_name $SLURM_JOB_ID
 """
     print(f"Submitting: {recording_name}")
@@ -123,8 +127,8 @@ Examples:
     parser.add_argument(
         "--project",
         type=str,
-        default="fly50_V6",
-        help="JARVIS project name (default: fly50_V6)",
+        default="merge_courtship_V3",
+        help="JARVIS project name (default: merge_courtship_V3)",
     )
     parser.add_argument(
         "--conda_env_name",
@@ -141,19 +145,19 @@ Examples:
     parser.add_argument(
         "--num_gpus",
         type=int,
-        default=1,
+        default=4,
         help="Number of GPUs per job (default: 1)",
     )
     parser.add_argument(
         "--mem",
         type=int,
-        default=64,
+        default=128,
         help="Memory in GB (default: 64)",
     )
     parser.add_argument(
         "--cpus",
         type=int,
-        default=8,
+        default=16,
         help="CPUs per task (default: 8)",
     )
     parser.add_argument(
