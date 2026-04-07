@@ -499,10 +499,21 @@ def run_prediction(
     )
 
     # Initialize identity tracker
+    tracker_cfg = getattr(cfg, 'TRACKER', {}) or {}
+    def _tg(key, default):
+        if isinstance(tracker_cfg, dict):
+            return tracker_cfg.get(key, default)
+        return getattr(tracker_cfg, key, default)
     tracker = MultiAnimalTracker(
         keypoint_names=cfg.KEYPOINT_NAMES,
         num_animals=num_animals,
         disable_swap_check=use_sam3_mask,
+        max_jump_mm=_tg('MAX_JUMP_MM', 5.0),
+        ema_alpha=_tg('EMA_ALPHA', 0.05),
+        swap_check_frames=_tg('SWAP_CHECK_FRAMES', 50),
+        velocity_alpha=_tg('VELOCITY_ALPHA', 0.5),
+        cost_size_weight=_tg('COST_SIZE_WEIGHT', 0.5),
+        disable_velocity_pred=_tg('DISABLE_VELOCITY_PRED', False),
     )
 
     # Load reprojection tool

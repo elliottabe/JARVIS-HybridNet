@@ -18,6 +18,16 @@ _C.PARENT_DIR = ''
 _C.KEYPOINT_NAMES = []
 _C.SKELETON = []
 
+# Multi-animal tracker (inference-only; declared here so yacs accepts the
+# block when it appears in project config.yaml files).
+_C.TRACKER = CN()
+_C.TRACKER.MAX_JUMP_MM = 5.0
+_C.TRACKER.EMA_ALPHA = 0.05
+_C.TRACKER.SWAP_CHECK_FRAMES = 50
+_C.TRACKER.VELOCITY_ALPHA = 0.5
+_C.TRACKER.COST_SIZE_WEIGHT = 0.5
+_C.TRACKER.DISABLE_VELOCITY_PRED = False
+
 
 #Dataset Configurations
 _C.DATASET = CN()

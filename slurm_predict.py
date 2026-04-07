@@ -268,3 +268,15 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
+
+
+'''
+CUDA_VISIBLE_DEVICES=0 /home/eabe/miniconda3/envs/jarvis/bin/jarvis-local train all \
+  --num_epochs_center 100 \
+  --num_epochs_keypoint 200 \
+  --num_epochs_hybridnet 100 \
+  fly50_V7 \
+  
+
+'''
