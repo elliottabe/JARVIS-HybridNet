@@ -6,10 +6,21 @@ non-maximum suppression, and assigns peaks consistently across cameras
 using multi-view geometry.
 """
 
+import os
 import torch
 
+# Debug: set JARVIS_PEAK_DEBUG=1 to print per-frame peak/threshold info.
+# Set JARVIS_PEAK_DUMP_DIR=/path/to/dir to also save raw heatmaps as .npz
+# (one file per frame, every JARVIS_PEAK_DUMP_EVERY frames; default 1).
+PEAK_DEBUG = os.environ.get("JARVIS_PEAK_DEBUG", "0") == "1"
+PEAK_DUMP_DIR = os.environ.get("JARVIS_PEAK_DUMP_DIR", "")
+PEAK_DUMP_EVERY = int(os.environ.get("JARVIS_PEAK_DUMP_EVERY", "1"))
+_DEBUG_FRAME_COUNT = 0
+if PEAK_DUMP_DIR:
+    os.makedirs(PEAK_DUMP_DIR, exist_ok=True)
 
-def extract_top_k_peaks(heatmaps, k=2, suppression_radius=15):
+
+def extract_top_k_peaks(heatmaps, k=2, suppression_radius=6):
     """
     Extract the top-k peaks from CenterDetect heatmaps using iterative NMS.
 
@@ -27,6 +38,17 @@ def extract_top_k_peaks(heatmaps, k=2, suppression_radius=15):
     num_cameras = heatmaps.shape[0]
     H, W = heatmaps.shape[2], heatmaps.shape[3]
     device = heatmaps.device
+
+    # Optional: dump raw heatmaps for offline inspection.
+    if PEAK_DUMP_DIR and (_DEBUG_FRAME_COUNT % PEAK_DUMP_EVERY == 0):
+        try:
+            import numpy as _np
+            _np.savez_compressed(
+                os.path.join(PEAK_DUMP_DIR, f"heatmap_{_DEBUG_FRAME_COUNT:08d}.npz"),
+                heatmaps=heatmaps.detach().cpu().numpy(),
+            )
+        except Exception as _e:
+            print(f"[peak_debug] heatmap dump failed: {_e}", flush=True)
 
     working = heatmaps.clone()
 
@@ -110,6 +132,21 @@ def assign_peaks_across_cameras(peaks, maxvals, reproTool, downsampling_scale,
         }]
 
     # Step 1: Initial triangulation using naive peak ordering
+    global _DEBUG_FRAME_COUNT
+    if PEAK_DEBUG:
+        per_animal_max = [maxvals[ai].squeeze().tolist() for ai in range(k)]
+        per_animal_ndet = [
+            int(torch.sum(maxvals[ai].squeeze() > confidence_threshold).item())
+            for ai in range(k)
+        ]
+        print(
+            f"[peak_debug f={_DEBUG_FRAME_COUNT}] thr={confidence_threshold} "
+            f"k={k} ncams={num_cameras} per_animal_ndet={per_animal_ndet} "
+            f"maxvals={per_animal_max}",
+            flush=True,
+        )
+        _DEBUG_FRAME_COUNT += 1
+
     initial_results = []
     for animal_idx in range(k):
         points = scaled_peaks[animal_idx]  # (num_cameras, 2)

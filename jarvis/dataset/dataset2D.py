@@ -177,7 +177,9 @@ class Dataset2D(BaseDataset):
             target_t = self.heatmap_generators[scale_id](joints_list[scale_id],
                         animal_size)
             target_list.append(target_t.astype(np.float32))
-        sample = [img, target_list, centers]
+        # Only return the first center in sample[2] for batch-collation
+        # (calculate_accuracy is single-peak; heatmap already encodes all peaks).
+        sample = [img, target_list, centers[:1]]
         return self.transform(sample)
 
 

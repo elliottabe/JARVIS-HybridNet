@@ -486,24 +486,27 @@ def run_prediction(
     # SAM3 masking is handled externally via SAM3StreamingTracker (video
     # propagation), not inside the predictor. The predictor receives
     # precomputed_masks per frame when SAM3 is enabled.
+    tracker_cfg = getattr(cfg, 'TRACKER', {}) or {}
+    def _tg(key, default):
+        if isinstance(tracker_cfg, dict):
+            return tracker_cfg.get(key, default)
+        return getattr(tracker_cfg, key, default)
+
     jarvisPredictor = JarvisMultiAnimalPredictor3D(
         cfg,
         num_animals=num_animals,
-        suppression_radius=suppression_radius,
+        suppression_radius=_tg('SUPPRESSION_RADIUS', suppression_radius),
+        confidence_threshold=_tg('CONFIDENCE_THRESHOLD', 0.5),
         mask_scale=mask_scale,
         weights_center_detect=weights_center_detect,
         weights_hybridnet=weights_hybridnet,
         trt_mode=trt_mode,
         use_sam3_mask=False,  # SAM3 handled externally via streaming tracker
         sam3_constrain_keypoints=sam3_constrain_keypoints,
+        multi_peak_trained=True,  # CenterDetect was trained on dual-fly heatmaps
     )
 
     # Initialize identity tracker
-    tracker_cfg = getattr(cfg, 'TRACKER', {}) or {}
-    def _tg(key, default):
-        if isinstance(tracker_cfg, dict):
-            return tracker_cfg.get(key, default)
-        return getattr(tracker_cfg, key, default)
     tracker = MultiAnimalTracker(
         keypoint_names=cfg.KEYPOINT_NAMES,
         num_animals=num_animals,
