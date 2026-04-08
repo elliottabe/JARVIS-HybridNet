@@ -85,7 +85,6 @@ python -u {predict_script} \\
     --video_folder {video_folder} \\
     --calib_folder {calib_folder} \\
     --num_animals 2 \\
-    --no_sam3_mask \\
     --num_gpus {num_gpus} \\
     --output_name $SLURM_JOB_ID
 """
@@ -127,8 +126,8 @@ Examples:
     parser.add_argument(
         "--project",
         type=str,
-        default="merge_courtship_V3",
-        help="JARVIS project name (default: merge_courtship_V3)",
+        default="courtship_multianimal_V1",
+        help="JARVIS project name (default: courtship_multianimal_V1)",
     )
     parser.add_argument(
         "--conda_env_name",
@@ -272,11 +271,17 @@ if __name__ == "__main__":
 
 
 '''
-CUDA_VISIBLE_DEVICES=0 /home/eabe/miniconda3/envs/jarvis/bin/jarvis-local train all \
-  --num_epochs_center 100 \
-  --num_epochs_keypoint 200 \
-  --num_epochs_hybridnet 100 \
-  fly50_V7 \
-  
+squeue -u $USER -h -o "%i %j" | awk '/jarvis_pred/ {print $1}' | xargs -r scancel
+
+Inference: 
+
+python ./slurm_predict.py --data_dir /gscratch/portia/eabe/data/Johnson_lab/Video_recordings/courtship/Session1 --dry-run
+
+
+
+Trianing: 
+CUDA_VISIBLE_DEVICES=0 /home/eabe/miniconda3/envs/jarvis/bin/jarvis-local train all --num_epochs_center 100 --num_epochs_keypoint 200 --num_epochs_hybridnet 100  fly50_V7 
+
+
 
 '''
