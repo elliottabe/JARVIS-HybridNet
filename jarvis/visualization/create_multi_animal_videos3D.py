@@ -330,16 +330,20 @@ def create_multi_animal_videos3D(
     for cap in caps:
         cap.release()
 
-    # Re-encode to H.264 via ffmpeg for broad playback compatibility
+    # cv2 writes avc1/H.264 directly but leaves the moov atom at the end of
+    # the file, which VSCode's preview can't handle. Stream-copy with
+    # -movflags +faststart so the moov atom moves to the front. This is a
+    # near-instant remux (no re-encode).
     if shutil.which('ffmpeg'):
         for mp4 in os.listdir(output_dir):
             if not mp4.endswith('.mp4'):
                 continue
             src = os.path.join(output_dir, mp4)
-            tmp = src + '.h264.mp4'
+            tmp = src + '.faststart.mp4'
             ret = subprocess.run(
-                ['ffmpeg', '-y', '-i', src, '-c:v', 'libx264',
-                 '-pix_fmt', 'yuv420p', '-loglevel', 'error', tmp],
+                ['ffmpeg', '-y', '-i', src,
+                 '-c', 'copy', '-movflags', '+faststart',
+                 '-loglevel', 'error', tmp],
                 capture_output=True,
             )
             if ret.returncode == 0:
@@ -347,7 +351,6 @@ def create_multi_animal_videos3D(
             else:
                 if os.path.exists(tmp):
                     os.remove(tmp)
-        print("  Re-encoded videos to H.264")
 
     print(f"  Visualization saved to: {output_dir}")
     return output_dir

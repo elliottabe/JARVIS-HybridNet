@@ -151,7 +151,7 @@ def create_video_writer_and_reader(params, reproTool, video_paths,
             frameRate = cap.get(cv2.CAP_PROP_FPS)
             outs.append(cv2.VideoWriter(os.path.join(params.output_dir,
                         path.split(os.sep)[-1].split(".")[0] + ".mp4"),
-                        cv2.VideoWriter_fourcc('m', 'p', '4', 'v'),
+                        cv2.VideoWriter_fourcc('a', 'v', 'c', '1'),
                         frameRate,
                         (img_size[0],img_size[1])))
         else:

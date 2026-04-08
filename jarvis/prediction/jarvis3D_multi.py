@@ -51,11 +51,11 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
             SAM3 masks to constrain keypoint detection within the fly body
     """
 
-    def __init__(self, cfg, num_animals=2, suppression_radius=3,
+    def __init__(self, cfg, num_animals=2, suppression_radius=4,
                  weights_center_detect='latest', weights_hybridnet='latest',
                  trt_mode='off', confidence_threshold=0.5, mask_scale=1.5,
-                 use_sam3_mask=True, sam3_device='cuda',
-                 sam3_text_prompt='fly', sam3_constrain_keypoints=True,
+                 use_sam3_mask=False, sam3_device='cuda',
+                 sam3_text_prompt='fly', sam3_constrain_keypoints=False,
                  sam3_detect_confidence=0.15,
                  multi_peak_trained=False):
         super(JarvisMultiAnimalPredictor3D, self).__init__()

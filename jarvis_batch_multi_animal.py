@@ -75,9 +75,12 @@ import glob
 import itertools
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -343,6 +346,29 @@ def get_video_paths(recording_path, reproTool):
     return video_paths
 
 
+def _viz_bout_worker(
+    project_name, recording_path, calib_folder, bout_csvs,
+    frame_start, number_frames, viz_cameras, mask_file, output_dir,
+):
+    """Top-level worker (picklable) that runs per-bout viz in a subprocess."""
+    # Import inside the worker so the parent process doesn't pay the cost.
+    from jarvis.visualization.create_multi_animal_videos3D import (
+        create_multi_animal_videos3D,
+    )
+    create_multi_animal_videos3D(
+        project_name=project_name,
+        recording_path=recording_path,
+        data_csvs=bout_csvs,
+        dataset_name=calib_folder,
+        frame_start=frame_start,
+        number_frames=number_frames,
+        video_cam_list=viz_cameras,
+        mask_file=mask_file,
+        output_dir=output_dir,
+    )
+    return output_dir
+
+
 def create_video_reader(video_paths, frame_start=0):
     """Create video capture objects."""
     caps = []
@@ -415,16 +441,19 @@ def run_prediction(
     weights_hybridnet="latest",
     trt_mode="off",
     n_jobs=17,
-    use_sam3_mask=True,
+    use_sam3_mask=False,
     sam3_device="cuda",
     sam3_text_prompt="fly",
-    sam3_constrain_keypoints=True,
+    sam3_constrain_keypoints=False,
     sam3_chunk_size=1000,
     resume_dir=None,
     output_name=None,
     output_dir=None,
     gpu_id=None,
     sam3_init_lock=None,
+    run_viz=False,
+    viz_cameras=None,
+    viz_max_workers=2,
 ):
     """
     Run multi-animal 3D prediction on a single video folder.
@@ -666,6 +695,23 @@ def run_prediction(
             text_prompt=sam3_text_prompt,
         )
 
+    # Per-bout viz pool: each bout's drawing/encoding runs in a subprocess
+    # while the next bout's GPU inference proceeds. CPU-bound, so it does
+    # not contend with the inference GPU.
+    viz_executor = None
+    viz_futures = []
+    viz_base_dir = None
+    if run_viz:
+        viz_base_dir = os.path.join(
+            output_dir,
+            f'visualization_multi_{time.strftime("%Y%m%d-%H%M%S")}',
+        )
+        os.makedirs(viz_base_dir, exist_ok=True)
+        viz_executor = ProcessPoolExecutor(max_workers=viz_max_workers)
+        gpu_print(f"{CLIColors.OKCYAN}Per-bout viz enabled "
+                  f"(pool={viz_max_workers}, out={viz_base_dir})"
+                  f"{CLIColors.ENDC}", gpu_id=gpu_id)
+
     # Process each bout
     for bout_idx, (bout_start, bout_end) in enumerate(resolved_bouts):
         bout_len = bout_end - bout_start + 1
@@ -677,6 +723,11 @@ def run_prediction(
                       gpu_id=gpu_id)
             continue
 
+        # Reset identity tracker so this bout doesn't inherit stale predicted
+        # positions / velocities from the previous bout (otherwise the
+        # max_jump cap holds every detection out → all-NaN bout).
+        tracker.reset()
+
         # Determine start offset within this bout (for partial resume)
         start_offset = 0
         if bout_idx == bouts_to_skip and resume_frame_offset > 0:
@@ -687,6 +738,27 @@ def run_prediction(
 
         # Dict to collect masks for visualization (saved as .npz after bout)
         mask_npz = {} if use_sam3_mask else None
+
+        # Per-bout CSV writers (used for parallel viz). We dual-write so the
+        # concatenated CSVs (resume + downstream API) stay intact.
+        bout_csv_paths = {}
+        bout_csv_files = {}
+        bout_csv_writers = {}
+        if viz_executor is not None:
+            for fly_id in fly_ids:
+                bp = os.path.join(
+                    viz_base_dir, f'data3D_{fly_id}_bout{bout_idx}.csv'
+                )
+                bf = open(bp, 'w', newline='')
+                bw = csv.writer(
+                    bf, delimiter=',', quotechar='"',
+                    quoting=csv.QUOTE_MINIMAL,
+                )
+                if has_header:
+                    create_header(bw, cfg)
+                bout_csv_paths[fly_id] = bp
+                bout_csv_files[fly_id] = bf
+                bout_csv_writers[fly_id] = bw
 
         # SAM3 chunking: for long bouts, re-initialize SAM3 every chunk_size
         # frames with overlap for smooth transitions.
@@ -759,9 +831,37 @@ def run_prediction(
                           f"{CLIColors.ENDC}", gpu_id=gpu_id)
 
         # Seek all cameras to bout start (+ offset for partial resume)
-        Parallel(n_jobs=n_jobs, require="sharedmem")(
-            delayed(seek)(cap, bout_start + start_offset) for cap in caps
-        )
+        for cap in caps:
+            seek(cap, bout_start + start_offset)
+
+        # Producer thread: decodes the next frame's 7 cams in parallel into a
+        # bounded queue while the main loop runs GPU work on the previous
+        # frame. This pipelines CPU JPEG decode with GPU compute, eliminating
+        # the bubble that was holding GPU utilisation at ~75%.
+        n_cams = len(caps)
+        n_decode_workers = min(n_cams, max(2, n_jobs))
+        prefetch_queue = queue.Queue(maxsize=4)
+        prefetch_stop = threading.Event()
+
+        def _producer():
+            with ThreadPoolExecutor(max_workers=n_decode_workers) as ex:
+                for _ in range(start_offset, bout_len):
+                    if prefetch_stop.is_set():
+                        return
+                    buf = np.empty(
+                        (n_cams, img_size[1], img_size[0], 3), dtype=np.uint8
+                    )
+                    futs = [
+                        ex.submit(read_images, cap, i, buf)
+                        for i, cap in enumerate(caps)
+                    ]
+                    for f in futs:
+                        f.result()
+                    prefetch_queue.put(buf)
+            prefetch_queue.put(None)  # sentinel
+
+        producer_thread = threading.Thread(target=_producer, daemon=True)
+        producer_thread.start()
 
         for frame_num in ProgressLogger(range(start_offset, bout_len), desc=desc, gpu_id=gpu_id):
             # Check if we need to switch to the next SAM3 chunk
@@ -800,11 +900,10 @@ def run_prediction(
                                 gpu_id=gpu_id)
                         gpu_print("SAM3 chunk ready.", gpu_id=gpu_id)
 
-            # Read images in parallel
-            Parallel(n_jobs=n_jobs, require="sharedmem")(
-                delayed(read_images)(cap, slice_idx, imgs_orig)
-                for slice_idx, cap in enumerate(caps)
-            )
+            # Pull next pre-decoded frame from producer thread
+            imgs_orig = prefetch_queue.get()
+            if imgs_orig is None:
+                break
 
             # Convert to tensor
             imgs = (
@@ -850,7 +949,7 @@ def run_prediction(
                                     fm['masks'].numpy())
                                 break
 
-            # Write results to per-animal CSVs
+            # Write results to per-animal CSVs (and per-bout CSVs if viz)
             for fly_id in fly_ids:
                 det = assignments.get(fly_id)
                 if det is not None and det.get('points3D') is not None:
@@ -858,6 +957,8 @@ def run_prediction(
                     confidences = det['confidences']
                     if points3D.dim() != 2:
                         writers[fly_id].writerow(nan_row)
+                        if fly_id in bout_csv_writers:
+                            bout_csv_writers[fly_id].writerow(nan_row)
                         continue
                     row = []
                     for point, conf in zip(
@@ -866,8 +967,12 @@ def run_prediction(
                     ):
                         row = row + point.tolist() + [conf]
                     writers[fly_id].writerow(row)
+                    if fly_id in bout_csv_writers:
+                        bout_csv_writers[fly_id].writerow(row)
                 else:
                     writers[fly_id].writerow(nan_row)
+                    if fly_id in bout_csv_writers:
+                        bout_csv_writers[fly_id].writerow(nan_row)
 
         # Save masks for visualization
         if mask_npz:
@@ -880,6 +985,15 @@ def run_prediction(
             gpu_print(f"Saved {len(mask_npz) - 1} mask frames to {mask_path}",
                       gpu_id=gpu_id)
 
+        # Stop producer thread (drain any leftover items)
+        prefetch_stop.set()
+        try:
+            while True:
+                prefetch_queue.get_nowait()
+        except queue.Empty:
+            pass
+        producer_thread.join(timeout=5)
+
         # Clean up streaming tracker and free memory for this bout
         if bout_sam3 is not None:
             bout_sam3.close()
@@ -887,10 +1001,43 @@ def run_prediction(
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Close per-bout CSVs and submit viz job (runs in background while
+        # the next bout's GPU inference proceeds).
+        if viz_executor is not None:
+            for fly_id in fly_ids:
+                bout_csv_files[fly_id].close()
+            mask_path = os.path.join(
+                output_dir, f'masks_bout{bout_idx}.npz')
+            viz_mask_file = mask_path if os.path.exists(mask_path) else None
+            bout_viz_dir = os.path.join(viz_base_dir, f'bout{bout_idx}')
+            fut = viz_executor.submit(
+                _viz_bout_worker,
+                project_name, video_folder, calib_folder,
+                dict(bout_csv_paths),
+                bout_start, bout_len, viz_cameras,
+                viz_mask_file, bout_viz_dir,
+            )
+            viz_futures.append((bout_idx, fut))
+            gpu_print(f"Submitted viz for bout {bout_idx + 1}/"
+                      f"{len(resolved_bouts)} → {bout_viz_dir}",
+                      gpu_id=gpu_id)
+
     # Safety release if lock was never released (e.g. all bouts skipped)
     if _sam3_lock_held:
         sam3_init_lock.release()
         _sam3_lock_held = False
+
+    # Wait for any in-flight per-bout viz jobs to finish
+    if viz_executor is not None:
+        gpu_print(f"Waiting for {len(viz_futures)} viz job(s) to finish...",
+                  gpu_id=gpu_id)
+        for bi, fut in viz_futures:
+            try:
+                fut.result()
+            except Exception as e:
+                gpu_print(f"{CLIColors.WARNING}Viz bout {bi} failed: "
+                          f"{e}{CLIColors.ENDC}", gpu_id=gpu_id)
+        viz_executor.shutdown(wait=True)
 
     # Cleanup
     for cap in caps:
@@ -936,6 +1083,7 @@ def run_prediction(
         "bouts": resolved_bouts,
         "total_bout_frames": total_bout_frames,
         "tracking_info": tracking_info,
+        "viz_output_dir": viz_base_dir,
     }
 
 
@@ -1219,7 +1367,7 @@ def run_prediction_multi_gpu(gpu_ids, common_kwargs, resolved_bouts,
     # Detect per-worker progress from a previous run (preempted mid-work).
     # Workers that already finished all their bouts are skipped; partially-
     # done workers resume via the existing CSV-row-count logic.
-    use_sam3 = common_kwargs.get('use_sam3_mask', True)
+    use_sam3 = common_kwargs.get('use_sam3_mask', False)
     resuming_workers = False
 
     # Build per-worker directories and detect progress
@@ -1469,9 +1617,9 @@ def main():
         help="Camera names to create visualization videos for (default: all)"
     )
     parser.add_argument(
-        "--no_sam3_mask", action="store_true",
-        help="Disable SAM3 per-frame segmentation and fall back to "
-             "mask-and-redetect approach. SAM3 is enabled by default."
+        "--use_sam3_mask", action="store_true",
+        help="Enable SAM3 per-frame segmentation. Disabled by default; "
+             "the multi-peak CenterDetect path is used instead."
     )
     parser.add_argument(
         "--sam3_device", type=str, default="cuda",
@@ -1593,7 +1741,7 @@ def main():
             weights_hybridnet=args.weights_hybridnet,
             trt_mode=args.trt_mode,
             n_jobs=args.n_jobs,
-            use_sam3_mask=not args.no_sam3_mask,
+            use_sam3_mask=args.use_sam3_mask,
             sam3_device=args.sam3_device,
             sam3_text_prompt=args.sam3_text_prompt,
             sam3_constrain_keypoints=not args.no_sam3_constrain_keypoints,
@@ -1658,10 +1806,23 @@ def main():
             common_kwargs['resume_dir'] = args.resume
             if args.gpus and len(args.gpus) == 1:
                 common_kwargs['gpu_id'] = args.gpus[0]
+            # Run per-bout viz inline (overlaps with next bout's inference)
+            common_kwargs['run_viz'] = (
+                args.run_viz or job.get("run_viz", False)
+            )
+            common_kwargs['viz_cameras'] = (
+                args.viz_cameras or job.get("viz_cameras", None)
+            )
             prediction_result = run_prediction(**common_kwargs)
 
         viz_output_dir = None
-        if prediction_result is not None and (
+        # If run_prediction already handled viz inline (per-bout parallel),
+        # use that output dir and skip the post-prediction viz block.
+        if prediction_result is not None and prediction_result.get(
+            "viz_output_dir"
+        ):
+            viz_output_dir = prediction_result["viz_output_dir"]
+        if prediction_result is not None and viz_output_dir is None and (
             args.run_viz or job.get("run_viz", False)
         ):
             viz_cameras = (args.viz_cameras

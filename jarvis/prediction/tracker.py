@@ -76,6 +76,14 @@ class MultiAnimalTracker:
         self.held_out_count = 0
         self.fly_ids = [f'fly{i}' for i in range(num_animals)]
 
+    def reset(self):
+        """Clear per-bout state but keep config and cumulative stats."""
+        self.prev_centers.clear()
+        self.prev_velocities.clear()
+        self.body_sizes.clear()
+        self.frame_count = 0
+        self.initialized = False
+
     def compute_body_length(self, points3D):
         """Euclidean distance from Antenna_Base to Abd_tip in mm."""
         if points3D is None:
