@@ -13,7 +13,6 @@ import time
 import cv2
 import numpy as np
 import torch
-from tqdm import tqdm
 from joblib import Parallel, delayed
 
 from jarvis.config.project_manager import ProjectManager
@@ -231,10 +230,22 @@ def create_multi_animal_videos3D(
         (len(caps), img_size[1], img_size[0], 3)
     ).astype(np.uint8)
 
-    print(f"  Creating visualization: {number_frames} frames, "
-          f"{len(fly_data)} flies, {sum(make_video_index)} cameras")
+    viz_tag = os.path.basename(output_dir.rstrip('/'))
+    print(f"  [viz {viz_tag}] starting: {number_frames} frames, "
+          f"{len(fly_data)} flies, {sum(make_video_index)} cameras",
+          flush=True)
+    _viz_t0 = time.time()
+    _viz_log_every = max(50, number_frames // 20)
 
-    for frame_num in tqdm(range(number_frames), desc="Visualizing"):
+    for frame_num in range(number_frames):
+        if frame_num and (frame_num % _viz_log_every == 0):
+            elapsed = time.time() - _viz_t0
+            fps = frame_num / elapsed if elapsed > 0 else 0
+            eta = (number_frames - frame_num) / fps if fps > 0 else 0
+            pct = 100 * frame_num / number_frames
+            print(f"  [viz {viz_tag}] {frame_num}/{number_frames} "
+                  f"({pct:.0f}%) | {fps:.1f} fps | ETA {eta:.0f}s",
+                  flush=True)
         # Read frames from all cameras
         Parallel(n_jobs=n_jobs, require='sharedmem')(
             delayed(read_images)(cap, idx, imgs_orig)
@@ -329,6 +340,11 @@ def create_multi_animal_videos3D(
             out.release()
     for cap in caps:
         cap.release()
+
+    _viz_total = time.time() - _viz_t0
+    _viz_fps = number_frames / _viz_total if _viz_total > 0 else 0
+    print(f"  [viz {viz_tag}] done: {number_frames} frames in "
+          f"{_viz_total:.0f}s ({_viz_fps:.1f} fps)", flush=True)
 
     # cv2 writes avc1/H.264 directly but leaves the moov atom at the end of
     # the file, which VSCode's preview can't handle. Stream-copy with

@@ -707,7 +707,13 @@ def run_prediction(
             f'visualization_multi_{time.strftime("%Y%m%d-%H%M%S")}',
         )
         os.makedirs(viz_base_dir, exist_ok=True)
-        viz_executor = ProcessPoolExecutor(max_workers=viz_max_workers)
+        # Use spawn so viz workers don't inherit the parent's CUDA context
+        # (forking after CUDA init silently breaks the child interpreter).
+        import multiprocessing as _mp
+        viz_executor = ProcessPoolExecutor(
+            max_workers=viz_max_workers,
+            mp_context=_mp.get_context('spawn'),
+        )
         gpu_print(f"{CLIColors.OKCYAN}Per-bout viz enabled "
                   f"(pool={viz_max_workers}, out={viz_base_dir})"
                   f"{CLIColors.ENDC}", gpu_id=gpu_id)
@@ -1018,6 +1024,15 @@ def run_prediction(
                 viz_mask_file, bout_viz_dir,
             )
             viz_futures.append((bout_idx, fut))
+
+            def _viz_done(f, _bi=bout_idx):
+                exc = f.exception()
+                if exc is not None:
+                    gpu_print(
+                        f"{CLIColors.WARNING}Viz bout {_bi} crashed: "
+                        f"{exc}{CLIColors.ENDC}", gpu_id=gpu_id)
+            fut.add_done_callback(_viz_done)
+
             gpu_print(f"Submitted viz for bout {bout_idx + 1}/"
                       f"{len(resolved_bouts)} → {bout_viz_dir}",
                       gpu_id=gpu_id)
