@@ -2,6 +2,9 @@ import argparse
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+import yaml
 
 
 def slurm_submit(script):
@@ -17,6 +20,57 @@ def slurm_submit(script):
         sys.exit(1)
 
 
+def _build_recording_to_bouts_map(bouts_root, data_dir, dataset):
+    """Walk `bouts_root` for Predictions_3D_* folders and match each one to a
+    recording folder under `data_dir` via its info.yaml `recording_path` field.
+
+    Returns a list of (recording_folder, bouts_csv, source_predictions_folder)
+    tuples. Folders with missing info.yaml, missing recording_path, missing
+    bouts CSV, or a recording_path outside `data_dir` are skipped with a
+    printed warning (never crash).
+    """
+    bouts_root = Path(bouts_root).resolve()
+    data_dir_resolved = Path(data_dir).resolve()
+    if not bouts_root.is_dir():
+        print(f"ERROR: --bouts_root not a directory: {bouts_root}", file=sys.stderr)
+        sys.exit(1)
+
+    csv_name = f"{dataset}_bouts_unified_summary.csv"
+    mapping = []
+    for pred_dir in sorted(bouts_root.glob("Predictions_3D_*")):
+        if not pred_dir.is_dir():
+            continue
+        info_yaml = pred_dir / "info.yaml"
+        if not info_yaml.exists():
+            print(f"  [skip] {pred_dir.name}: no info.yaml")
+            continue
+        try:
+            with open(info_yaml) as fh:
+                info = yaml.safe_load(fh) or {}
+        except Exception as e:
+            print(f"  [skip] {pred_dir.name}: failed to parse info.yaml ({e})")
+            continue
+        rec_path = info.get("recording_path")
+        if not rec_path:
+            print(f"  [skip] {pred_dir.name}: no recording_path in info.yaml")
+            continue
+        rec_path = Path(os.path.realpath(rec_path))
+        try:
+            rec_path.relative_to(data_dir_resolved)
+        except ValueError:
+            print(f"  [skip] {pred_dir.name}: recording_path {rec_path} not under --data_dir")
+            continue
+        if not rec_path.is_dir():
+            print(f"  [skip] {pred_dir.name}: recording_path does not exist: {rec_path}")
+            continue
+        bouts_csv = pred_dir / csv_name
+        if not bouts_csv.exists():
+            print(f"  [skip] {pred_dir.name}: no {csv_name}")
+            continue
+        mapping.append((rec_path, bouts_csv, pred_dir))
+    return mapping
+
+
 def submit_predict(
     video_folder,
     calib_folder,
@@ -28,6 +82,10 @@ def submit_predict(
     mem,
     cpus,
     time_limit,
+    bouts_csv=None,
+    stage_dir=None,
+    src_pred_dir=None,
+    dataset=None,
 ):
     """Construct and submit a SLURM prediction job.
 
@@ -51,7 +109,36 @@ def submit_predict(
     predict_script = os.path.join(jarvis_root, "jarvis_batch_multi_animal.py")
 
     # Derive a short name from the recording folder
-    recording_name = os.path.basename(video_folder.rstrip("/"))
+    recording_name = os.path.basename(str(video_folder).rstrip("/"))
+
+    bouts_line = f" \\\n    --bouts_csv {bouts_csv}" if bouts_csv else ""
+
+    # In bouts mode, stage the new JARVIS output into a sibling
+    # <bouts_root>_bouts/Predictions_3D_<job_id>/ directory so the downstream
+    # 3d_tracking pipeline (slurm_run.py / run_full_pipeline.py) can discover
+    # it via its existing rglob('Predictions_3D_*') + '<dataset>_bouts*.csv'
+    # logic. We symlink data3D_fly{0,1}.csv from the recording's new
+    # Predictions folder and symlink info.yaml + bouts summary CSVs from the
+    # source Predictions folder (the one under --bouts_root).
+    stage_block = ""
+    if stage_dir and src_pred_dir and dataset:
+        stage_block = f"""
+# --- Option A staging: expose this bouts-mode run to the downstream pipeline
+STAGE_DIR={stage_dir}
+PRED_DIR={video_folder}/Predictions_3D_$SLURM_JOB_ID
+if [ -f "$PRED_DIR/data3D_fly0.csv" ] && [ -f "$PRED_DIR/data3D_fly1.csv" ]; then
+    mkdir -p "$STAGE_DIR"
+    ln -sfn "$PRED_DIR/data3D_fly0.csv" "$STAGE_DIR/data3D_fly0.csv"
+    ln -sfn "$PRED_DIR/data3D_fly1.csv" "$STAGE_DIR/data3D_fly1.csv"
+    ln -sfn {src_pred_dir}/info.yaml "$STAGE_DIR/info.yaml"
+    for f in {src_pred_dir}/{dataset}_bouts_*summary.csv; do
+        [ -f "$f" ] && ln -sfn "$f" "$STAGE_DIR/$(basename $f)"
+    done
+    echo "Staged bouts prediction to $STAGE_DIR"
+else
+    echo "WARNING: expected data3D_fly{{0,1}}.csv missing in $PRED_DIR, skipping staging"
+fi
+"""
 
     script = f"""#!/bin/bash
 #SBATCH --job-name={job_name}_{recording_name}
@@ -86,8 +173,8 @@ python -u {predict_script} \\
     --calib_folder {calib_folder} \\
     --num_animals 2 \\
     --num_gpus {num_gpus} \\
-    --output_name $SLURM_JOB_ID
-"""
+    --output_name $SLURM_JOB_ID{bouts_line}
+{stage_block}"""
     print(f"Submitting: {recording_name}")
     job_id = slurm_submit(script)
     print(f"  Job ID: {job_id}")
@@ -172,6 +259,24 @@ Examples:
         help="Base job name (default: jarvis_pred)",
     )
     parser.add_argument(
+        "--bouts_root",
+        type=str,
+        default=None,
+        help="If set, switch to bouts mode: scan this directory for "
+        "Predictions_3D_* folders, read each info.yaml's recording_path "
+        "to map it to a recording under --data_dir, and submit one JARVIS "
+        "job per match with --bouts_csv pointed at that folder's "
+        "<dataset>_bouts_unified_summary.csv.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="courtship",
+        help="Dataset name used to locate <dataset>_bouts_unified_summary.csv "
+        "inside each Predictions_3D_* folder under --bouts_root "
+        "(default: courtship)",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print jobs that would be submitted without actually submitting",
@@ -180,66 +285,86 @@ Examples:
     args = parser.parse_args()
 
     data_dir = args.data_dir
-
-    # Determine if data_dir is a session directory (contains recording folders)
-    # or a single recording folder (contains video files)
     video_extensions = {".mp4", ".avi", ".mov", ".mkv"}
-    has_videos = any(
-        os.path.splitext(f)[1].lower() in video_extensions
-        for f in os.listdir(data_dir)
-        if os.path.isfile(os.path.join(data_dir, f))
-    )
 
-    if has_videos:
-        # data_dir is a single recording folder
-        recording_folders = [data_dir]
+    # Build the list of (recording_folder, bouts_csv) pairs to submit.
+    # In bouts mode, we drive from --bouts_root and map back to recordings
+    # via each Predictions_3D_*/info.yaml's recording_path field.
+    # In default mode, we walk --data_dir for recording folders (legacy).
+    if args.bouts_root:
+        print(f"\nBouts mode: scanning {args.bouts_root}")
+        mapping = _build_recording_to_bouts_map(
+            args.bouts_root, data_dir, args.dataset
+        )
+        if not mapping:
+            print("No Predictions_3D_* folders mapped to recordings; nothing to submit.")
+            return
+        # Stage root: sibling of --bouts_root with "_bouts" suffix.
+        bouts_root_p = Path(args.bouts_root).resolve()
+        stage_root = bouts_root_p.parent / f"{bouts_root_p.name}_bouts"
+        submissions = [
+            (str(rec), str(csv), str(pred), pred.name) for rec, csv, pred in mapping
+        ]
+        print(f"\nMapped {len(submissions)} recording(s) from bouts_root:")
+        print(f"Stage root (downstream pipeline base-dir): {stage_root}")
+        for rec, csv, _src_path, src_name in submissions:
+            print(f"  {os.path.basename(rec)}  <-  {src_name}  ({os.path.basename(csv)})")
     else:
-        # data_dir is a session directory; find recording subfolders
-        recording_folders = sorted(
-            [
-                os.path.join(data_dir, d)
-                for d in os.listdir(data_dir)
-                if os.path.isdir(os.path.join(data_dir, d))
-            ]
-        )
-
-    # Filter to folders that actually contain video files
-    valid_recordings = []
-    for folder in recording_folders:
-        has_vid = any(
+        # Legacy full-recording mode.
+        has_videos = any(
             os.path.splitext(f)[1].lower() in video_extensions
-            for f in os.listdir(folder)
-            if os.path.isfile(os.path.join(folder, f))
+            for f in os.listdir(data_dir)
+            if os.path.isfile(os.path.join(data_dir, f))
         )
-        if has_vid:
-            valid_recordings.append(folder)
+        if has_videos:
+            recording_folders = [data_dir]
         else:
-            print(f"Skipping (no videos): {folder}")
-
-    if not valid_recordings:
-        print("No recording folders with video files found.")
-        sys.exit(1)
-
-    print(f"\nFound {len(valid_recordings)} recording(s) to process:")
-    for r in valid_recordings:
-        print(f"  {os.path.basename(r)}")
+            recording_folders = sorted(
+                [
+                    os.path.join(data_dir, d)
+                    for d in os.listdir(data_dir)
+                    if os.path.isdir(os.path.join(data_dir, d))
+                ]
+            )
+        valid_recordings = []
+        for folder in recording_folders:
+            has_vid = any(
+                os.path.splitext(f)[1].lower() in video_extensions
+                for f in os.listdir(folder)
+                if os.path.isfile(os.path.join(folder, f))
+            )
+            if has_vid:
+                valid_recordings.append(folder)
+            else:
+                print(f"Skipping (no videos): {folder}")
+        if not valid_recordings:
+            print("No recording folders with video files found.")
+            sys.exit(1)
+        print(f"\nFound {len(valid_recordings)} recording(s) to process:")
+        for r in valid_recordings:
+            print(f"  {os.path.basename(r)}")
+        submissions = [(r, None, None, None) for r in valid_recordings]
+        stage_root = None
     print()
 
     # Ensure OutFiles directory exists
     os.makedirs("OutFiles", exist_ok=True)
 
-    # Submit one job per recording
+    # Submit one job per (recording, optional bouts_csv) pair
     submitted_jobs = []
-    for recording_folder in valid_recordings:
+    for recording_folder, bouts_csv, src_pred_dir, src_name in submissions:
         # Find calibration folder
         calib_folder = os.path.join(recording_folder, "calibration")
         if not os.path.isdir(calib_folder):
             print(f"WARNING: No calibration/ folder in {recording_folder}, skipping")
             continue
 
+        recording_name = os.path.basename(str(recording_folder).rstrip("/"))
         if args.dry_run:
-            recording_name = os.path.basename(recording_folder.rstrip("/"))
-            print(f"[DRY RUN] Would submit: {recording_name}")
+            if bouts_csv:
+                print(f"[DRY RUN] Would submit: {recording_name}  bouts={bouts_csv}  (from {src_name})")
+            else:
+                print(f"[DRY RUN] Would submit: {recording_name}")
             continue
 
         job_id = submit_predict(
@@ -252,6 +377,14 @@ Examples:
             num_gpus=args.num_gpus,
             mem=args.mem,
             cpus=args.cpus,
+            bouts_csv=bouts_csv,
+            stage_dir=(
+                str(stage_root / f"Predictions_3D_$SLURM_JOB_ID")
+                if (stage_root and src_pred_dir)
+                else None
+            ),
+            src_pred_dir=src_pred_dir,
+            dataset=args.dataset if src_pred_dir else None,
             time_limit=args.time,
         )
         submitted_jobs.append((os.path.basename(recording_folder), job_id))
