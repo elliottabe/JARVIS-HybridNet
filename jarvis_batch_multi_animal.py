@@ -454,6 +454,7 @@ def run_prediction(
     run_viz=False,
     viz_cameras=None,
     viz_max_workers=2,
+    min_animal_separation_mm=0.0,
 ):
     """
     Run multi-animal 3D prediction on a single video folder.
@@ -521,6 +522,20 @@ def run_prediction(
             return tracker_cfg.get(key, default)
         return getattr(tracker_cfg, key, default)
 
+    # Identity-collapse guard threshold. When > 0, two tracks whose
+    # triangulated 3D centers are within this many millimetres are
+    # collapsed down to one in both multi_peak and the tracker, so the
+    # downstream CSV will never contain two tracks centered on the same
+    # physical animal. Default 0 keeps existing single-species behaviour.
+    # Caller-supplied value takes precedence; otherwise read from project
+    # config under TRACKER.MIN_ANIMAL_SEPARATION_MM. 0 keeps legacy behaviour.
+    if not min_animal_separation_mm:
+        min_animal_separation_mm = float(
+            _tg('MIN_ANIMAL_SEPARATION_MM', 0.0)
+        )
+    else:
+        min_animal_separation_mm = float(min_animal_separation_mm)
+
     jarvisPredictor = JarvisMultiAnimalPredictor3D(
         cfg,
         num_animals=num_animals,
@@ -533,6 +548,7 @@ def run_prediction(
         use_sam3_mask=False,  # SAM3 handled externally via streaming tracker
         sam3_constrain_keypoints=sam3_constrain_keypoints,
         multi_peak_trained=True,  # CenterDetect was trained on dual-fly heatmaps
+        min_animal_separation_mm=min_animal_separation_mm,
     )
 
     # Initialize identity tracker
@@ -546,6 +562,7 @@ def run_prediction(
         velocity_alpha=_tg('VELOCITY_ALPHA', 0.5),
         cost_size_weight=_tg('COST_SIZE_WEIGHT', 0.5),
         disable_velocity_pred=_tg('DISABLE_VELOCITY_PRED', False),
+        min_animal_separation_mm=min_animal_separation_mm,
     )
 
     # Load reprojection tool
@@ -1680,6 +1697,14 @@ def main():
         help="Number of GPUs to use (shorthand for --gpus 0 1 ... N-1). "
              "Ignored if --gpus is also provided."
     )
+    parser.add_argument(
+        "--min_animal_separation_mm", type=float, default=0.0,
+        help="Identity-collapse guard threshold in mm. When > 0, two "
+             "triangulated animal centers closer than this are collapsed to "
+             "one in multi_peak and the tracker so the output never contains "
+             "two tracks on the same physical animal. ~1.0 mm is a reasonable "
+             "floor for courtship Drosophila. 0 disables (default)."
+    )
 
     args = parser.parse_args()
 
@@ -1762,6 +1787,7 @@ def main():
             sam3_constrain_keypoints=not args.no_sam3_constrain_keypoints,
             sam3_chunk_size=args.sam3_chunk_size,
             output_name=args.output_name,
+            min_animal_separation_mm=args.min_animal_separation_mm,
         )
 
         use_multi_gpu = args.gpus is not None and len(args.gpus) > 1

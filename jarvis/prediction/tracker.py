@@ -51,7 +51,8 @@ class MultiAnimalTracker:
                  disable_swap_check=False,
                  velocity_alpha=0.5,
                  cost_size_weight=0.5,
-                 disable_velocity_pred=False):
+                 disable_velocity_pred=False,
+                 min_animal_separation_mm=0.0):
         self.keypoint_names = list(keypoint_names)
         self.num_animals = num_animals
         self.max_jump_mm = max_jump_mm
@@ -61,6 +62,12 @@ class MultiAnimalTracker:
         self.velocity_alpha = velocity_alpha
         self.cost_size_weight = cost_size_weight
         self.disable_velocity_pred = disable_velocity_pred
+        # Belt-and-suspenders identity-collapse guard: if two incoming
+        # detections' 3D centers are closer than this threshold, drop the
+        # less-confident one before running Hungarian, so we don't lock
+        # two tracks onto the same physical animal. 0 disables. A matching
+        # check lives upstream in multi_peak.assign_peaks_across_cameras.
+        self.min_animal_separation_mm = min_animal_separation_mm
 
         # Keypoint indices for body size computation
         self.antenna_base_idx = self.keypoint_names.index('Antenna_Base')
@@ -110,6 +117,16 @@ class MultiAnimalTracker:
             self.frame_count += 1
             return {fid: None for fid in self.fly_ids}
 
+        # Belt-and-suspenders collapse guard: if upstream multi_peak didn't
+        # filter collapsed duplicates (e.g. its threshold is lower than
+        # ours, or it ran without the guard), drop them here before they
+        # reach Hungarian matching.
+        detections = self._filter_collapsed_detections(detections)
+
+        if len(detections) == 0:
+            self.frame_count += 1
+            return {fid: None for fid in self.fly_ids}
+
         if not self.initialized:
             return self._initial_assignment(detections)
 
@@ -117,6 +134,46 @@ class MultiAnimalTracker:
             return self._single_detection_assignment(detections[0])
 
         return self._hungarian_assignment(detections)
+
+    def _filter_collapsed_detections(self, detections):
+        """Drop members of any pair of detections whose 3D centers are
+        closer than ``self.min_animal_separation_mm``.
+
+        When two detections collide, the one with more cameras (tiebreak:
+        higher mean keypoint confidence) is kept; the other is dropped.
+        Returns the pruned list. No-op when the guard is disabled.
+        """
+        if self.min_animal_separation_mm <= 0 or len(detections) < 2:
+            return detections
+
+        def _score(det):
+            # Prefer more camera support; fall back to mean kp confidence.
+            n_cams = int(det.get('num_cams_detect', 0))
+            confs = det.get('confidences')
+            if confs is None:
+                mean_conf = 0.0
+            else:
+                mean_conf = float(torch.mean(confs).item())
+            return (n_cams, mean_conf)
+
+        pruned = list(detections)
+        changed = True
+        while changed and len(pruned) >= 2:
+            changed = False
+            for i in range(len(pruned)):
+                for j in range(i + 1, len(pruned)):
+                    d_ij = torch.norm(
+                        pruned[i]['center3D'] - pruned[j]['center3D']
+                    ).item()
+                    if d_ij < self.min_animal_separation_mm:
+                        drop = j if _score(pruned[i]) >= _score(pruned[j]) else i
+                        pruned.pop(drop)
+                        self.held_out_count += 1
+                        changed = True
+                        break
+                if changed:
+                    break
+        return pruned
 
     def _initial_assignment(self, detections):
         """

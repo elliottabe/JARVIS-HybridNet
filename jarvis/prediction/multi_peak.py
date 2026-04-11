@@ -85,7 +85,8 @@ def extract_top_k_peaks(heatmaps, k=2, suppression_radius=6):
 
 
 def assign_peaks_across_cameras(peaks, maxvals, reproTool, downsampling_scale,
-                                confidence_threshold=5):
+                                confidence_threshold=5,
+                                min_animal_separation_mm=0.0):
     """
     Assign multi-peak detections consistently across cameras using multi-view
     geometry. Handles the case where peak[0] in camera A might correspond to
@@ -97,6 +98,13 @@ def assign_peaks_across_cameras(peaks, maxvals, reproTool, downsampling_scale,
         reproTool: ReprojectionTool instance with cameraMatrices set
         downsampling_scale: tensor (2,) mapping heatmap coords to image coords
         confidence_threshold: minimum confidence to consider a detection valid
+        min_animal_separation_mm: if > 0, reject any pair of returned animal
+            centers whose 3D distance is below this threshold. When a
+            collapse is detected, the lower-confidence member of the pair
+            is dropped so the frame is downgraded to fewer-than-k
+            detections. The tracker's single-detection path then holds out
+            the other animal rather than locking two tracks onto the same
+            physical animal.
 
     Returns:
         list of dicts, one per animal, each containing:
@@ -105,6 +113,8 @@ def assign_peaks_across_cameras(peaks, maxvals, reproTool, downsampling_scale,
             'maxvals': (num_cameras, 1) tensor of confidences
             'num_cams_detect': int, number of cameras with valid detection
         Animals with fewer than 2 camera detections are excluded.
+        May return fewer than ``k`` entries when
+        ``min_animal_separation_mm`` triggers a collapse drop.
     """
     k = peaks.shape[0]
     num_cameras = peaks.shape[1]
@@ -245,5 +255,49 @@ def assign_peaks_across_cameras(peaks, maxvals, reproTool, downsampling_scale,
                 'maxvals': mvals,
                 'num_cams_detect': int(num_detect),
             })
+
+    # Step 5: Identity-collapse guard. Step 1's naive peak ordering can leave
+    # two animal entries triangulated onto the *same* physical animal when
+    # one fly is occluded (the "second-brightest" peak in every camera is on
+    # the first fly). Steps 2-4 then lock that collapse in. Drop any pair of
+    # results whose 3D centers are closer than ``min_animal_separation_mm``,
+    # keeping the more confident one. The tracker's single-detection path
+    # (tracker._single_detection_assignment) then assigns the survivor to
+    # the nearest fly and holds out the other, which is strictly better
+    # than two phantom tracks on the same animal.
+    if min_animal_separation_mm > 0 and len(results) >= 2:
+        def _score(r):
+            # Higher is better: more cameras first, then higher mean maxval
+            # over the cameras that passed threshold.
+            mv = r['maxvals'].squeeze()
+            valid = mv > confidence_threshold
+            mean_conf = float(mv[valid].mean().item()) if valid.any() else 0.0
+            return (int(r['num_cams_detect']), mean_conf)
+
+        # Iteratively drop the lower-scoring member of any collapsed pair
+        # until no pair is within the cap. O(n^2) but n is tiny (2-3).
+        dropped_any = True
+        while dropped_any and len(results) >= 2:
+            dropped_any = False
+            for i in range(len(results)):
+                for j in range(i + 1, len(results)):
+                    d_ij = torch.norm(
+                        results[i]['center3D'] - results[j]['center3D']
+                    ).item()
+                    if d_ij < min_animal_separation_mm:
+                        drop = j if _score(results[i]) >= _score(results[j]) else i
+                        if PEAK_DEBUG or os.environ.get("JARVIS_COLLAPSE_DEBUG", "0") == "1":
+                            print(
+                                f"[collapse_guard] dropping animal {drop}: "
+                                f"3D distance {d_ij:.3f} mm < "
+                                f"{min_animal_separation_mm:.3f} mm "
+                                f"(scores {_score(results[i])} vs {_score(results[j])})",
+                                flush=True,
+                            )
+                        results.pop(drop)
+                        dropped_any = True
+                        break
+                if dropped_any:
+                    break
 
     return results

@@ -57,7 +57,8 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
                  use_sam3_mask=False, sam3_device='cuda',
                  sam3_text_prompt='fly', sam3_constrain_keypoints=False,
                  sam3_detect_confidence=0.15,
-                 multi_peak_trained=False):
+                 multi_peak_trained=False,
+                 min_animal_separation_mm=0.0):
         super(JarvisMultiAnimalPredictor3D, self).__init__()
         self.cfg = cfg
         self.num_animals = num_animals
@@ -66,6 +67,11 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
         self.mask_scale = mask_scale
         self.sam3_constrain_keypoints = sam3_constrain_keypoints
         self.multi_peak_trained = multi_peak_trained
+        # Identity-collapse guard passed to multi_peak.assign_peaks_across_cameras.
+        # When > 0, any pair of animals whose triangulated 3D centers are
+        # within this distance is dropped down to a single detection so the
+        # tracker cannot lock two tracks onto the same physical animal.
+        self.min_animal_separation_mm = float(min_animal_separation_mm)
 
         # Optional SAM3 masker
         self.sam3_masker = None
@@ -614,6 +620,7 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
         assignments = assign_peaks_across_cameras(
             sam3_peaks, sam3_maxvals, self.reproTool, downsampling_scale,
             confidence_threshold=self.confidence_threshold,
+            min_animal_separation_mm=self.min_animal_separation_mm,
         )
 
         if not assignments:
@@ -784,6 +791,7 @@ class JarvisMultiAnimalPredictor3D(nn.Module):
         assignments = assign_peaks_across_cameras(
             peaks, maxvals, self.reproTool, downsampling_scale,
             confidence_threshold=self.confidence_threshold,
+            min_animal_separation_mm=self.min_animal_separation_mm,
         )
 
         # Step 4: Run HybridNet for each assigned animal
