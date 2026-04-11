@@ -164,7 +164,7 @@ module load gcc/12
 set -x
 source ~/.bashrc
 nvidia-smi
-conda activate {conda_env_name}
+micromamba activate {conda_env_name}
 unset LD_LIBRARY_PATH
 echo $SLURMD_NODENAME
 echo "Processing recording: {video_folder}"
