@@ -134,6 +134,7 @@ if [ -f "$PRED_DIR/data3D_fly0.csv" ] && [ -f "$PRED_DIR/data3D_fly1.csv" ]; the
     for f in {src_pred_dir}/{dataset}_bouts_*summary.csv; do
         [ -f "$f" ] && ln -sfn "$f" "$STAGE_DIR/$(basename $f)"
     done
+    [ -f "$PRED_DIR/tracking_info.json" ] && ln -sfn "$PRED_DIR/tracking_info.json" "$STAGE_DIR/tracking_info.json"
     echo "Staged bouts prediction to $STAGE_DIR"
 else
     echo "WARNING: expected data3D_fly{{0,1}}.csv missing in $PRED_DIR, skipping staging"
@@ -197,6 +198,11 @@ Examples:
 
   # Predict a single recording:
   python slurm_predict.py --data_dir /path/to/session/2026_03_03_13_25_13
+
+  # Re-run into a date-stamped stage dir so it stays separate from an existing one:
+  python slurm_predict.py --data_dir /path/to/session \\
+      --bouts_root /path/to/session/04092026 \\
+      --stage_suffix $(date +%m%d%Y)
 
   # Dry run (see what would be submitted):
   python slurm_predict.py --data_dir /path/to/session --dry_run
@@ -277,6 +283,17 @@ Examples:
         "(default: courtship)",
     )
     parser.add_argument(
+        "--stage_suffix",
+        type=str,
+        default=None,
+        help="Optional suffix appended to the stage root directory name. "
+        "Without this flag, the stage root is <bouts_root>_bouts (default, "
+        "unchanged). With e.g. --stage_suffix $(date +%%m%%d%%Y), it becomes "
+        "<bouts_root>_bouts_<suffix>, letting you isolate a re-run from an "
+        "existing staged directory. The suffix is a literal string — shell "
+        "command substitution happens in your shell, not in Python.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print jobs that would be submitted without actually submitting",
@@ -299,9 +316,15 @@ Examples:
         if not mapping:
             print("No Predictions_3D_* folders mapped to recordings; nothing to submit.")
             return
-        # Stage root: sibling of --bouts_root with "_bouts" suffix.
+        # Stage root: sibling of --bouts_root with "_bouts" suffix. If
+        # --stage_suffix is given, append "_<suffix>" so re-runs can be
+        # isolated from existing staged directories (e.g.
+        # --stage_suffix $(date +%m%d%Y)).
         bouts_root_p = Path(args.bouts_root).resolve()
-        stage_root = bouts_root_p.parent / f"{bouts_root_p.name}_bouts"
+        stage_name = f"{bouts_root_p.name}_bouts"
+        if args.stage_suffix:
+            stage_name = f"{stage_name}_{args.stage_suffix}"
+        stage_root = bouts_root_p.parent / stage_name
         submissions = [
             (str(rec), str(csv), str(pred), pred.name) for rec, csv, pred in mapping
         ]
@@ -410,6 +433,7 @@ Inference:
 
 python ./slurm_predict.py --data_dir /gscratch/portia/eabe/data/Johnson_lab/Video_recordings/courtship/Session1 --dry-run
 
+python slurm_predict.py --data_dir /gscratch/portia/eabe/data/Johnson_lab/Video_recordings/courtship/Session1 --bouts_root /gscratch/portia/eabe/data/Johnson_lab/courtship/04092026 --stage_suffix $(date +%m%d%Y)
 
 
 Trianing: 
