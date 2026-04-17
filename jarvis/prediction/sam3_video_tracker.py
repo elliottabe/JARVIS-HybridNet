@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time as _time
 
 import cv2
 import numpy as np
@@ -24,6 +25,104 @@ if SAM3_PATH not in sys.path:
     sys.path.insert(0, SAM3_PATH)
 
 import gc
+
+
+class _LogTqdm:
+    """Drop-in for tqdm.tqdm that emits periodic log lines instead of a
+    live progress bar. SAM3 propagation (sam3_multiplex_tracking,
+    sam3_video_inference, io_utils frame loaders) wraps per-frame loops in
+    `from tqdm.auto import tqdm`, which in non-tty SLURM logs produces
+    thousands of useless carriage-return-flood lines. Logging every
+    ``LOG_EVERY`` items OR ``LOG_INTERVAL_S`` seconds (whichever comes
+    first), plus one line at start and finish, gives tractable output.
+    """
+    LOG_EVERY = 500
+    LOG_INTERVAL_S = 30.0
+
+    def __init__(self, iterable=None, desc=None, total=None,
+                 disable=False, **_kw):
+        self.iterable = iterable
+        self.desc = desc or "iter"
+        self.total = total if total is not None else (
+            len(iterable) if hasattr(iterable, "__len__") else None)
+        self.disable = disable
+        self.n = 0
+        self._t0 = None
+        self._t_last = None
+
+    def _emit(self, msg):
+        if not self.disable:
+            print(f"[tqdm] {msg}", flush=True)
+
+    def __iter__(self):
+        self._t0 = _time.time()
+        self._t_last = self._t0
+        tot = f"/{self.total}" if self.total else ""
+        self._emit(f"{self.desc}: start (total={self.total})")
+        last_logged = 0
+        for item in self.iterable:
+            yield item
+            self.n += 1
+            now = _time.time()
+            if (self.n - last_logged >= self.LOG_EVERY
+                    or now - self._t_last >= self.LOG_INTERVAL_S):
+                rate = self.n / max(now - self._t0, 1e-6)
+                self._emit(f"{self.desc}: {self.n}{tot}  "
+                           f"({rate:.1f} it/s, {now - self._t0:.1f}s)")
+                last_logged = self.n
+                self._t_last = now
+        elapsed = _time.time() - (self._t0 or _time.time())
+        self._emit(f"{self.desc}: done {self.n}{tot} in {elapsed:.1f}s")
+
+    def update(self, n=1):
+        if self._t0 is None:
+            self._t0 = _time.time()
+            self._t_last = self._t0
+            self._emit(f"{self.desc}: start (total={self.total})")
+        self.n += n
+        now = _time.time()
+        if now - self._t_last >= self.LOG_INTERVAL_S:
+            rate = self.n / max(now - self._t0, 1e-6)
+            tot = f"/{self.total}" if self.total else ""
+            self._emit(f"{self.desc}: {self.n}{tot}  "
+                       f"({rate:.1f} it/s, {now - self._t0:.1f}s)")
+            self._t_last = now
+
+    def close(self):
+        if self._t0 is not None:
+            elapsed = _time.time() - self._t0
+            tot = f"/{self.total}" if self.total else ""
+            self._emit(f"{self.desc}: done {self.n}{tot} in {elapsed:.1f}s")
+            self._t0 = None
+
+    def set_description(self, d, refresh=None):
+        self.desc = d
+
+    def set_postfix(self, *a, **k):
+        pass
+
+    def refresh(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+def _patch_tqdm_for_sam3():
+    """Replace tqdm.tqdm and tqdm.auto.tqdm so SAM3's `from tqdm.auto import
+    tqdm` picks up _LogTqdm. Safe to call before sam3 is imported; modules
+    that already did `from tqdm import tqdm` before this runs keep the
+    original reference (e.g. jarvis training code)."""
+    import tqdm as _tqdm_pkg
+    import tqdm.auto as _tqdm_auto
+    _tqdm_pkg.tqdm = _LogTqdm
+    _tqdm_auto.tqdm = _LogTqdm
+
+
+_patch_tqdm_for_sam3()
 
 from sam3.model_builder import build_sam3_predictor, build_sam3_video_predictor
 

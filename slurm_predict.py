@@ -87,6 +87,7 @@ def submit_predict(
     src_pred_dir=None,
     dataset=None,
     predict_script_name='jarvis_batch_multi_animal.py',
+    save_clips=False,
 ):
     """Construct and submit a SLURM prediction job.
 
@@ -117,6 +118,7 @@ def submit_predict(
     recording_name = os.path.basename(str(video_folder).rstrip("/"))
 
     bouts_line = f" \\\n    --bouts_csv {bouts_csv}" if bouts_csv else ""
+    save_clips_line = " \\\n    --save-clips" if save_clips else ""
 
     # In bouts mode, stage the new JARVIS output into a sibling
     # <bouts_root>_bouts/Predictions_3D_<job_id>/ directory so the downstream
@@ -179,7 +181,7 @@ python -u {predict_script} \\
     --calib_folder {calib_folder} \\
     --num_animals 2 \\
     --num_gpus {num_gpus} \\
-    --output_name $SLURM_JOB_ID{bouts_line}
+    --output_name $SLURM_JOB_ID{bouts_line}{save_clips_line}
 {stage_block}"""
     print(f"Submitting: {recording_name}")
     job_id = slurm_submit(script)
@@ -308,6 +310,13 @@ Examples:
              "pairs, use `tools/predict3D_multianimal_shard.py`.",
     )
     parser.add_argument(
+        "--save_clips",
+        action="store_true",
+        help="Pass --save-clips through to the predict script so per-bout "
+             "annotated video clips are written alongside the 3D predictions. "
+             "Only meaningful with --predict_script tools/predict3D_multianimal_shard.py.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print jobs that would be submitted without actually submitting",
@@ -424,6 +433,7 @@ Examples:
             dataset=args.dataset if src_pred_dir else None,
             time_limit=args.time,
             predict_script_name=args.predict_script,
+            save_clips=args.save_clips,
         )
         submitted_jobs.append((os.path.basename(recording_folder), job_id))
 

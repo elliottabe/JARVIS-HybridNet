@@ -72,7 +72,7 @@ def main():
     ap.add_argument('--no-sam3-compile', dest='sam3_compile',
                     action='store_false')
     ap.add_argument('--sam3-checkpoint', default=None)
-    ap.add_argument('--save-masks', action='store_true')
+    ap.add_argument('--save-masks', action='store_true', default=True)
     ap.add_argument('--reuse-masks', action='store_true')
     ap.add_argument('--save-overlays-every', type=int, default=0)
     ap.add_argument('--save-clips', action='store_true')
