@@ -1979,3 +1979,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''
+python tools/predict3D_multianimal.py \
+  --project red_data_unified \
+  --session /data2/users/eabe/datasets/Johnson_lab/courtship/Session0/2025_10_20_13_20_04 \
+  --bouts-csv /data2/users/eabe/datasets/Johnson_lab/courtship/Session0/2025_10_20_13_20_04/courtship_bouts_unified_summary.csv \
+  --bouts 29 \
+  --out /data2/users/eabe/datasets/Johnson_lab/courtship/Session0/2025_10_20_13_20_04/Predictions_3D_V4_phase4 \
+  --num-animals 2 --sam3-gpu 1 \
+  --sam3-version sam3.1 --sam3-compile \
+  --save-masks --save-clips
+
+'''

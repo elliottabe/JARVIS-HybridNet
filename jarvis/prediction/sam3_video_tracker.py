@@ -176,23 +176,35 @@ class BoutMasks:
         SAM3 assigns independent obj_ids per camera. This method finds
         which obj_id in each camera corresponds to the same physical fly.
 
-        Anchor-frame selection: pick the frame (from a scan across the
-        bout) that maximizes the minimum per-camera pairwise centroid
-        separation between the ``num_animals`` top-scoring masks. A
-        well-separated anchor frame makes the downstream naive Step-1
-        triangulation in ``assign_peaks_across_cameras`` well-conditioned
-        and eliminates the per-camera identity swaps that occur when two
-        flies are close and SAM3 scores flip order across runs.
+        Two-step anchor-based matching:
 
-        Per-camera obj ordering uses a deterministic tiebreak
-        ``(-score, cx, cy, obj_id)`` so identical SAM3 outputs produce
-        identical peak tensors across GPUs.
+        (1) Scan up to 200 frames and rank candidates by the tuple
+            (cams_ok, min_sep) — cams with ≥num_animals masks, and the
+            minimum per-camera pairwise centroid separation of the
+            top-num_animals masks (pixels). A well-separated anchor makes
+            the enumeration below numerically stable.
+
+        (2) At the anchor, enumerate 2^(C-1) per-camera peak orderings
+            (fixing the first camera's ordering as reference). For each
+            bitmask, triangulate each animal's 3D center across all
+            cameras-with-data, reproject back, sum per-(animal, camera)
+            2D residuals, and pick the bitmask minimizing total residual.
+            If the runner-up bitmask's residual is within 2× of the
+            winner's, fall back to the next-best anchor candidate from
+            the scan (up to 5 attempts). Without this exhaustive search,
+            the older naive Step-1 triangulation inside
+            assign_peaks_across_cameras settles on 5-vs-2 mixed orderings
+            on ambiguous anchors, locking in a per-camera identity swap
+            for the whole bout.
+
+        Per-camera sort tiebreak `(-score, cx, cy, obj_id)` only affects
+        which two masks we keep when a camera has >num_animals objects —
+        the enumeration makes the final ordering independent of this
+        tiebreak.
         """
-        from jarvis.prediction.multi_peak import assign_peaks_across_cameras
+        dev = repro_tool.cameraMatrices.device
 
-        # Score candidate frames by the minimum per-camera pairwise
-        # centroid separation of the top-num_animals masks (in pixels).
-        # Larger = better-conditioned anchor.
+        # --- Step 1: rank anchor candidates -------------------------
         def _frame_separation(f):
             min_sep = float('inf')
             cams_ok = 0
@@ -217,79 +229,235 @@ class BoutMasks:
             return cams_ok, (min_sep if min_sep < float('inf') else 0.0)
 
         scan_limit = min(self.num_frames, 200)
-        best_frame = 0
-        best_key = (-1, -1.0)  # (cams_ok, min_sep)
+        ranked = []  # list of (cams_ok, min_sep, frame)
         for f in range(scan_limit):
             cams_ok, sep = _frame_separation(f)
-            key = (cams_ok, sep)
-            if key > best_key:
-                best_key = key
-                best_frame = f
+            if cams_ok >= 2:  # need 2 cams for a triangulation
+                ranked.append((cams_ok, sep, f))
+        if not ranked:
+            print("  [assign_identities] WARNING: no frame with ≥2 cams "
+                  "having ≥num_animals masks; identity map will be empty")
+            for cam in range(self.num_cameras):
+                self.identity_map[cam] = {}
+            return
+        # Descending by (cams_ok, sep)
+        ranked.sort(key=lambda r: (-r[0], -r[1]))
 
-        # Build peak tensors from SAM3 centroids at best_frame.
-        # `assign_peaks_across_cameras` bmm's these against the reproTool's
-        # camera matrices, which live on CUDA, so place them on the same
-        # device as the reproTool to avoid a mixed-device RuntimeError.
-        dev = repro_tool.cameraMatrices.device
-        k = num_animals
-        peaks = torch.zeros(k, self.num_cameras, 2, device=dev)
-        maxvals = torch.zeros(k, self.num_cameras, 1, device=dev)
+        # --- Step 2: per-anchor enumeration -------------------------
+        if num_animals != 2:
+            raise NotImplementedError(
+                f"assign_identities enumeration only handles num_animals=2, "
+                f"got {num_animals}"
+            )
 
-        # Track which obj_ids correspond to which peak index per camera
-        cam_obj_ids = [[] for _ in range(self.num_cameras)]
+        def _evaluate_anchor(anchor_frame):
+            # Collect top-num_animals masks per camera at anchor_frame.
+            # Returns None if fewer than 2 cameras have enough masks.
+            cams_with_data = []
+            peaks_list = []  # peaks_list[i] ~ tensor (num_animals, 2) on dev
+            obj_ids_list = []  # obj_ids_list[i] ~ list of int
+            for cam in range(self.num_cameras):
+                fd = self.masks[cam][anchor_frame]
+                if len(fd) < num_animals:
+                    continue
+                sorted_objs = sorted(
+                    fd.items(),
+                    key=lambda x: (-x[1]['score'],
+                                   float(x[1]['centroid'][0]),
+                                   float(x[1]['centroid'][1]),
+                                   int(x[0])),
+                )[:num_animals]
+                cents = np.stack([d['centroid'] for _, d in sorted_objs])
+                cams_with_data.append(cam)
+                peaks_list.append(torch.as_tensor(cents, dtype=torch.float32,
+                                                  device=dev))
+                obj_ids_list.append([int(oid) for oid, _ in sorted_objs])
+            n_cd = len(cams_with_data)
+            if n_cd < 2:
+                return None
 
-        for cam in range(self.num_cameras):
-            frame_data = self.masks[cam][best_frame]
-            if not frame_data:
+            # For each bitmask, compute total 2D reprojection residual.
+            # Bit i (0-indexed, 0..n_cd-2) swaps cams_with_data[i+1]'s ordering.
+            num_bm = 1 << (n_cd - 1)
+            residuals_by_bm = np.zeros(num_bm, dtype=np.float64)
+            # Cache per-cam 2D points per-animal as we go
+            mvs_template = torch.zeros(self.num_cameras, 1, 1, device=dev)
+            for i, cam in enumerate(cams_with_data):
+                mvs_template[cam, 0, 0] = 1.0
+
+            for bm in range(num_bm):
+                # Resolve per-cam local ordering for this bitmask
+                local_idx_a0 = np.empty(n_cd, dtype=np.int64)
+                for i in range(n_cd):
+                    swap = 0 if i == 0 else ((bm >> (i - 1)) & 1)
+                    local_idx_a0[i] = swap  # a0's local peak index
+                local_idx_a1 = 1 - local_idx_a0  # a1 takes the other peak
+
+                total = 0.0
+                for animal_idx, local_idx_arr in (
+                        (0, local_idx_a0), (1, local_idx_a1)):
+                    pts = torch.zeros(self.num_cameras, 2, device=dev)
+                    for i, cam in enumerate(cams_with_data):
+                        pts[cam] = peaks_list[i][int(local_idx_arr[i])]
+                    # reconstructPoint wants (2, num_cameras) and
+                    # (num_cameras, 1, 1) maxvals.
+                    center3D = repro_tool.reconstructPoint(
+                        pts.t().contiguous(), mvs_template)
+                    reproj = repro_tool.reprojectPoint(
+                        center3D.unsqueeze(0)).squeeze(0)  # (num_cams, 2)
+                    for i, cam in enumerate(cams_with_data):
+                        delta = reproj[cam] - peaks_list[i][
+                            int(local_idx_arr[i])]
+                        total += float(torch.linalg.norm(delta).item())
+                residuals_by_bm[bm] = total
+
+            order = np.argsort(residuals_by_bm)
+            winner_bm = int(order[0])
+            winner_res = float(residuals_by_bm[winner_bm])
+            runner_up_res = (float(residuals_by_bm[int(order[1])])
+                             if len(order) > 1 else winner_res * 10.0)
+            margin = (runner_up_res / winner_res) if winner_res > 1e-6 else float('inf')
+
+            # Store the 3D centers from the winner so we can reuse them
+            # below when building identity_map for cams not in cams_with_data.
+            winner_local_a0 = np.empty(n_cd, dtype=np.int64)
+            for i in range(n_cd):
+                swap = 0 if i == 0 else ((winner_bm >> (i - 1)) & 1)
+                winner_local_a0[i] = swap
+            winner_local_a1 = 1 - winner_local_a0
+
+            centers3D = []
+            for animal_idx, local_idx_arr in (
+                    (0, winner_local_a0), (1, winner_local_a1)):
+                pts = torch.zeros(self.num_cameras, 2, device=dev)
+                for i, cam in enumerate(cams_with_data):
+                    pts[cam] = peaks_list[i][int(local_idx_arr[i])]
+                c3d = repro_tool.reconstructPoint(
+                    pts.t().contiguous(), mvs_template)
+                centers3D.append(c3d)
+
+            return {
+                'cams_with_data': cams_with_data,
+                'peaks_list': peaks_list,
+                'obj_ids_list': obj_ids_list,
+                'winner_bm': winner_bm,
+                'winner_res': winner_res,
+                'runner_up_res': runner_up_res,
+                'margin': margin,
+                'winner_local_a0': winner_local_a0,
+                'winner_local_a1': winner_local_a1,
+                'centers3D': centers3D,
+            }
+
+        MAX_FALLBACKS = 5
+        MARGIN_THRESH = 2.0
+        attempts = []
+        for cams_ok, sep, f in ranked[:MAX_FALLBACKS]:
+            r = _evaluate_anchor(f)
+            if r is None:
                 continue
-            # Deterministic tiebreak so the same SAM3 outputs produce
-            # identical per-camera ordering across GPUs: sort by
-            # (-score, cx, cy, obj_id).
-            sorted_objs = sorted(
-                frame_data.items(),
-                key=lambda x: (-x[1]['score'],
-                               float(x[1]['centroid'][0]),
-                               float(x[1]['centroid'][1]),
-                               int(x[0])),
-            )[:k]
-            for pi, (obj_id, data) in enumerate(sorted_objs):
-                peaks[pi, cam] = torch.tensor(data['centroid'])
-                maxvals[pi, cam, 0] = data['score'] * 255
-                cam_obj_ids[cam].append(obj_id)
+            attempts.append((f, cams_ok, sep, r))
+            if r['margin'] >= MARGIN_THRESH:
+                break
+        if not attempts:
+            print("  [assign_identities] WARNING: no evaluable anchor; "
+                  "identity map will be empty")
+            for cam in range(self.num_cameras):
+                self.identity_map[cam] = {}
+            return
 
-        print(f"  [assign_identities] anchor frame={best_frame} "
-              f"(cams_ok={best_key[0]}, min_sep={best_key[1]:.1f}px)")
+        # Prefer the attempt with the highest runner-up margin.
+        anchor_frame, cams_ok, sep, result = max(
+            attempts, key=lambda a: a[3]['margin'])
 
-        # Use existing multi-peak assignment
-        # downsampling_scale=0.5 so *2 scaling is identity (centroids in pixels)
-        downsampling_scale = torch.tensor([0.5, 0.5], device=dev)
-        assignments = assign_peaks_across_cameras(
-            peaks, maxvals, repro_tool, downsampling_scale,
-            confidence_threshold=0.1,
-        )
+        winner_bm = result['winner_bm']
+        cams_with_data = result['cams_with_data']
+        peaks_list = result['peaks_list']
+        obj_ids_list = result['obj_ids_list']
+        n_cd = len(cams_with_data)
+        swapped_cams = [cams_with_data[i] for i in range(1, n_cd)
+                        if (winner_bm >> (i - 1)) & 1]
 
-        # Build identity map: for each camera, map SAM3 obj_id → global fly idx
+        print(f"  [assign_identities] anchor frame={anchor_frame} "
+              f"(cams_ok={cams_ok}, min_sep={sep:.1f}px) "
+              f"swapped_cams={swapped_cams} "
+              f"total_res={result['winner_res']:.1f}px "
+              f"runner_up_ratio={result['margin']:.2f}x")
+        if result['margin'] < MARGIN_THRESH:
+            print(f"  [assign_identities] WARNING: runner-up margin "
+                  f"{result['margin']:.2f}x < {MARGIN_THRESH}x after "
+                  f"{len(attempts)} anchor attempts — identity may be "
+                  f"ambiguous.")
+
+        # --- Step 3: build identity_map ----------------------------
         for cam in range(self.num_cameras):
             self.identity_map[cam] = {}
 
-        for fly_idx, animal in enumerate(assignments):
-            assigned_2d = animal['points2D']  # (num_cameras, 2)
-            for cam in range(self.num_cameras):
-                frame_data = self.masks[cam][best_frame]
-                if not frame_data:
-                    continue
-                # Find which obj_id is closest to the assigned 2D point
-                best_obj = None
-                best_dist = float('inf')
-                for obj_id, data in frame_data.items():
-                    dist = np.linalg.norm(
-                        data['centroid'] - assigned_2d[cam].cpu().numpy()
-                    )
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_obj = obj_id
-                if best_obj is not None:
-                    self.identity_map[cam][best_obj] = fly_idx
+        # Direct mapping for cams with data at anchor (we already know
+        # which local peak index is fly 0 vs fly 1).
+        for i, cam in enumerate(cams_with_data):
+            a0_local = int(result['winner_local_a0'][i])
+            a1_local = int(result['winner_local_a1'][i])
+            self.identity_map[cam][obj_ids_list[i][a0_local]] = 0
+            self.identity_map[cam][obj_ids_list[i][a1_local]] = 1
+
+        # For cams NOT in cams_with_data (had <num_animals masks at
+        # anchor), reproject both 3D centers into that cam and match
+        # each surviving obj_id to the closer fly.
+        centers3D = result['centers3D']
+        for cam in range(self.num_cameras):
+            if cam in cams_with_data:
+                continue
+            frame_data = self.masks[cam][anchor_frame]
+            if not frame_data:
+                continue
+            reproj_per_fly = []
+            for c3d in centers3D:
+                r = repro_tool.reprojectPoint(
+                    c3d.unsqueeze(0)).squeeze(0)  # (num_cameras, 2)
+                reproj_per_fly.append(r[cam].detach().cpu().numpy())
+            for obj_id, data in frame_data.items():
+                dists = [float(np.linalg.norm(data['centroid'] - rf))
+                         for rf in reproj_per_fly]
+                self.identity_map[cam][int(obj_id)] = int(np.argmin(dists))
+
+        # --- Step 4: male-as-fly0 via mask area ---------------------
+        # Female D. melanogaster are ~15-20% larger than males. Sum
+        # mask pixels per fly_idx across every-10th frame × all cams
+        # and swap identity_map if fly0 is the larger (= female).
+        area = np.zeros(num_animals, dtype=np.float64)
+        frame_step = max(1, self.num_frames // 50)
+        for cam in range(self.num_cameras):
+            id_map = self.identity_map[cam]
+            if not id_map:
+                continue
+            for f in range(0, self.num_frames, frame_step):
+                for obj_id, data in self.masks[cam][f].items():
+                    fly_idx = id_map.get(int(obj_id))
+                    if fly_idx is None or fly_idx >= num_animals:
+                        continue
+                    area[fly_idx] += float(data['mask'].sum())
+        a0, a1 = area[0], area[1]
+        denom = min(a0, a1)
+        ratio = (max(a0, a1) / denom) if denom > 0 else 0.0
+        if a0 > 0 and a1 > 0 and ratio >= 1.05:
+            if a0 > a1:
+                for cam in range(self.num_cameras):
+                    self.identity_map[cam] = {
+                        oid: (1 - fi)
+                        for oid, fi in self.identity_map[cam].items()
+                    }
+                print(f"  [assign_identities] sex-ID: "
+                      f"area[0]={a0:.0f} area[1]={a1:.0f} "
+                      f"ratio={ratio:.2f} -> swap (fly0=male)")
+            else:
+                print(f"  [assign_identities] sex-ID: "
+                      f"area[0]={a0:.0f} area[1]={a1:.0f} "
+                      f"ratio={ratio:.2f} (fly0 already smaller=male)")
+        else:
+            print(f"  [assign_identities] sex-ID: area[0]={a0:.0f} "
+                  f"area[1]={a1:.0f} ratio={ratio:.2f} < 1.05 — "
+                  f"ambiguous, keeping enumfix ordering")
 
     def get_frame(self, frame_idx, num_animals=2):
         """
