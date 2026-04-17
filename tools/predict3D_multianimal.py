@@ -116,12 +116,16 @@ def get_video_paths(session_dir, repro_tool):
     return paths
 
 
-def read_frame_all_cams(caps, frame_idx):
-    """Seek every cap to frame_idx and decode. Returns (num_cams, H, W, 3)
-    uint8 array in BGR order (cv2 default)."""
+def read_frame_all_cams(caps, frame_idx=None):
+    """Read the next frame from each capture sequentially. Callers must
+    seek each cap to the bout's start frame exactly once beforehand —
+    per-frame seeks collapse GPU utilization because every seek triggers
+    a decode from the preceding keyframe.
+    `frame_idx` is ignored here; kept for signature stability with the
+    previous seeking version.
+    """
     frames = []
     for cap in caps:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, img = cap.read()
         if not ok:
             return None
@@ -148,7 +152,7 @@ def clamp_crop_centers(centerHMs, img_size_xy, bbox_hw):
 
 
 def build_4ch_crops(imgs_rgb_u8, centerHMs, target_masks, distractor_masks,
-                    bbox_hw, mean_rgb, std_rgb):
+                    bbox_hw, mean_rgb, std_rgb, device='cuda'):
     """Build normalized 4-channel input tensor for the KP net.
 
     Args:
@@ -189,7 +193,7 @@ def build_4ch_crops(imgs_rgb_u8, centerHMs, target_masks, distractor_masks,
                                  cx - bbox_hw:cx + bbox_hw]
             out[i, 3] = tmask.astype(np.float32)
 
-    return torch.from_numpy(out).cuda()
+    return torch.from_numpy(out).to(device)
 
 
 def run_kp_and_3d(kp_model, hybridNet, imgs_4ch, center3D, centerHMs,
@@ -238,9 +242,10 @@ def csv_writer_for_fly(out_dir, fly_idx, cfg):
         joints = list(itertools.chain.from_iterable(
             itertools.repeat(x, 4) for x in cfg.KEYPOINT_NAMES))
         coords = ['x', 'y', 'z', 'conf'] * len(cfg.KEYPOINT_NAMES)
-        w.writerow(joints)
-        w.writerow(coords)
-    # Extra column to mark absolute frame index.
+        # Leading 'frame' column marks the absolute video frame index;
+        # keeps header width == data width (50*4 + 1).
+        w.writerow(['frame'] + joints)
+        w.writerow(['frame'] + coords)
     return f, w
 
 
@@ -434,10 +439,16 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
     num_cams = len(video_paths)
     bbox_hw = cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE // 2
     cd_input_size = int(cfg.CENTERDETECT.IMAGE_SIZE)
-    cameraMatrices = repro_tool.cameraMatrices.cuda()
+    # Anchor every CUDA op in this function to the reproTool's device — with
+    # SAM3 living on a separate GPU, the process-wide default may point
+    # elsewhere and `.cuda()` silently goes to the wrong card.
+    dev = repro_tool.cameraMatrices.device
+    cameraMatrices = repro_tool.cameraMatrices.to(dev)
 
-    # Open caps once; seek per frame.
+    # Open caps once; seek to bout start once; read sequentially after.
     caps = [cv2.VideoCapture(p) for p in video_paths]
+    for cap in caps:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, bout['start'])
 
     num_frames = bout['end'] - bout['start'] + 1
     files = []
@@ -458,7 +469,7 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
 
     for f_local in range(num_frames):
         abs_frame = bout['start'] + f_local
-        frames_bgr = read_frame_all_cams(caps, abs_frame)
+        frames_bgr = read_frame_all_cams(caps)
         if frames_bgr is None:
             break
         if img_size_xy is None:
@@ -466,9 +477,9 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
 
         # RGB uint8 + normalized tensor for CenterDetect.
         frames_rgb = frames_bgr[..., ::-1].copy()
-        imgs = torch.from_numpy(frames_rgb).cuda().float().permute(0, 3, 1, 2) / 255.
-        mean_t = torch.tensor(mean_rgb, device=imgs.device).view(3, 1, 1)
-        std_t = torch.tensor(std_rgb, device=imgs.device).view(3, 1, 1)
+        imgs = torch.from_numpy(frames_rgb).to(dev).float().permute(0, 3, 1, 2) / 255.
+        mean_t = torch.tensor(mean_rgb, device=dev).view(3, 1, 1)
+        std_t = torch.tensor(std_rgb, device=dev).view(3, 1, 1)
         imgs_norm = (imgs - mean_t) / std_t
 
         # Pull pre-computed SAM3 masks for this frame (organized by global fly).
@@ -504,13 +515,13 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
 
             # Compute 3D center using this fly's SAM3 centroids as 2D
             # targets and triangulate.
-            centroids = slot['centroids'].cuda()                # (C, 2)
+            centroids = slot['centroids'].to(dev)               # (C, 2)
             mvals = torch.where(
-                torch.from_numpy(valid).cuda().unsqueeze(1),
-                torch.ones(num_cams, 1, device='cuda') * 0.9,
-                torch.zeros(num_cams, 1, device='cuda'))
+                torch.from_numpy(valid).to(dev).unsqueeze(1),
+                torch.ones(num_cams, 1, device=dev) * 0.9,
+                torch.zeros(num_cams, 1, device=dev))
             center3D = repro_tool.reconstructPoint(
-                centroids.transpose(0, 1), mvals)
+                centroids.transpose(0, 1), mvals.unsqueeze(1))
             if not torch.isfinite(center3D).all():
                 continue
 
@@ -520,7 +531,7 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
 
             imgs_4ch = build_4ch_crops(
                 frames_rgb, centerHMs, target_masks, distractor_masks,
-                bbox_hw, mean_rgb, std_rgb)
+                bbox_hw, mean_rgb, std_rgb, device=dev)
 
             points3D, confs = run_kp_and_3d(
                 kp_model, hybridNet, imgs_4ch,
@@ -602,6 +613,11 @@ def main():
                     help='If >0, write a 1×num_cams PNG overlay '
                          '(RGB + mask tint + KP dots) every N frames per '
                          'bout under <bout>/overlays/. 0 disables.')
+    ap.add_argument('--save-clips', action='store_true',
+                    help='After each bout, render one annotated MP4 per '
+                         'camera under <bout>/clips/ via '
+                         'jarvis.visualization.create_multi_animal_videos3D '
+                         '(skeleton + SAM3 mask overlays).')
     args = ap.parse_args()
 
     pm = ProjectManager()
@@ -671,6 +687,33 @@ def main():
                      num_animals=args.num_animals,
                      save_overlays_every=args.save_overlays_every)
         print(f'  3D predict in {time.time() - t0:.1f}s')
+
+        if args.save_clips:
+            from jarvis.visualization.create_multi_animal_videos3D import (
+                create_multi_animal_videos3D,
+            )
+            data_csvs = {
+                f'fly{i}': os.path.join(bout_out, f'fly{i}.csv')
+                for i in range(args.num_animals)
+                if os.path.isfile(os.path.join(bout_out, f'fly{i}.csv'))
+            }
+            if data_csvs:
+                t0 = time.time()
+                create_multi_animal_videos3D(
+                    project_name=args.project,
+                    recording_path=session_dir,
+                    data_csvs=data_csvs,
+                    dataset_name=None,
+                    frame_start=bout['start'],
+                    number_frames=n,
+                    video_cam_list=None,
+                    output_dir=os.path.join(bout_out, 'clips'),
+                    n_jobs=min(len(video_paths), 8),
+                    mask_file=os.path.join(bout_out, MASKS_FILENAME)
+                    if os.path.isfile(os.path.join(bout_out, MASKS_FILENAME))
+                    else None,
+                )
+                print(f'  clips in {time.time() - t0:.1f}s')
 
         del bout_masks
         gc.collect()

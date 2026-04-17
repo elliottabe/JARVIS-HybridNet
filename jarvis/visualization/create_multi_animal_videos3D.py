@@ -53,26 +53,91 @@ def load_csv_data(csv_path):
         data = data[2:]
     if len(data) == 0:
         return None, None
+    # Some writers prepend a frame-index column (ncols == num_joints*4 + 1).
+    # Strip it so downstream slicing on 4-wide (x,y,z,conf) groups lines up.
+    if data.shape[1] % 4 == 1:
+        data = data[:, 1:]
     # Extract x,y,z (remove every 4th column which is confidence)
     points3D = np.delete(data, list(range(3, data.shape[1], 4)), axis=1)
     confidences = data[:, 3::4]
     return points3D, confidences
 
 
+class _MaskStore:
+    """Unified lookup for two on-disk SAM3 mask layouts.
+
+    Legacy: flat NPZ with per-frame keys `f{NNNNNN}_{fly_id}` plus a
+        `_meta` array of `[H, W, num_cameras]`.
+    Packed-ACF (new, from tools/predict3D_multianimal.py): arrays
+        `packed[A, C, F, H, W_pack]`, `valid[A, C, F]`, `centroids`,
+        `shape=[H, W]`.
+    """
+
+    def __init__(self, data):
+        self.data = data
+        if 'packed' in data.files:
+            self.format = 'acf'
+            self.packed = data['packed']
+            self.valid = data['valid']
+            shape = data['shape']
+            self.H, self.W = int(shape[0]), int(shape[1])
+            self.num_animals = int(self.packed.shape[0])
+            self.num_cameras = int(self.packed.shape[1])
+            self.num_frames = int(self.packed.shape[2])
+        else:
+            self.format = 'legacy'
+            meta_arr = data['_meta']
+            self.H = int(meta_arr[0])
+            self.W = int(meta_arr[1])
+            self.num_cameras = int(meta_arr[2])
+
+    @property
+    def meta(self):
+        return (self.H, self.W, self.num_cameras)
+
+    def get_masks_for(self, frame_num, fly_id=None, fly_idx=None):
+        """Return (num_cameras, H, W) bool array, or None."""
+        if self.format == 'acf':
+            if fly_idx is None or fly_idx >= self.num_animals:
+                return None
+            if frame_num >= self.num_frames:
+                return None
+            out = np.zeros(
+                (self.num_cameras, self.H, self.W), dtype=bool)
+            for cam in range(self.num_cameras):
+                if not bool(self.valid[fly_idx, cam, frame_num]):
+                    continue
+                row = self.packed[fly_idx, cam, frame_num]
+                unpacked = np.unpackbits(
+                    row, axis=1, bitorder='big')[:, :self.W]
+                out[cam] = unpacked.astype(bool)
+            return out
+        # legacy
+        if fly_id is None:
+            return None
+        key = f'f{frame_num:06d}_{fly_id}'
+        if key not in self.data:
+            return None
+        packed = self.data[key]
+        flat = np.unpackbits(packed)
+        total = self.num_cameras * self.H * self.W
+        return flat[:total].reshape(
+            self.num_cameras, self.H, self.W).astype(bool)
+
+
 def load_mask_data(mask_file):
     """Load saved SAM3 masks from an .npz file.
 
     Returns:
-        masks_dict: dict mapping 'f{frame:06d}_{fly_id}' -> packed bool array
-        meta: (H, W, num_cameras) tuple
-        Returns (None, None) if mask_file is None or doesn't exist.
+        (_MaskStore, (H, W, num_cameras)) or (None, None) if the file is
+        missing. The store auto-detects the legacy per-frame-key layout
+        and the newer packed-(A,C,F) layout.
     """
     if mask_file is None or not os.path.exists(mask_file):
         return None, None
     data = np.load(mask_file, allow_pickle=True)
-    meta_arr = data['_meta']
-    meta = (int(meta_arr[0]), int(meta_arr[1]), int(meta_arr[2]))
-    return data, meta
+    store = _MaskStore(data)
+    return store, store.meta
 
 
 def overlay_mask(img, mask, color, alpha=0.3):
@@ -255,22 +320,17 @@ def create_multi_animal_videos3D(
         # Draw SAM3 mask overlays (before skeletons so they appear on top)
         if mask_data is not None:
             H_mask, W_mask, n_cams_mask = mask_meta
-            for fly_id in fly_ids:
-                key = f'f{frame_num:06d}_{fly_id}'
-                if key not in mask_data:
+            for i, fly_id in enumerate(fly_ids):
+                masks_bool = mask_data.get_masks_for(
+                    frame_num, fly_id=fly_id, fly_idx=i)
+                if masks_bool is None:
                     continue
-                packed = mask_data[key]
-                masks_flat = np.unpackbits(packed)
-                total_bits = n_cams_mask * H_mask * W_mask
-                masks_bool = masks_flat[:total_bits].reshape(
-                    n_cams_mask, H_mask, W_mask).astype(bool)
                 color = fly_colors.get(fly_id, (128, 128, 128))
                 for cam_idx in range(len(outs)):
                     if not make_video_index[cam_idx]:
                         continue
                     if cam_idx < n_cams_mask:
                         cam_mask = masks_bool[cam_idx]
-                        # Resize mask if image size differs
                         if (cam_mask.shape[0] != img_size[1]
                                 or cam_mask.shape[1] != img_size[0]):
                             cam_mask = cv2.resize(
