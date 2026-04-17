@@ -16,6 +16,7 @@ from torchvision import transforms
 import imgaug.augmenters as iaa
 from imgaug.augmentables import (Keypoint, KeypointsOnImage,
                                 BoundingBox, BoundingBoxesOnImage)
+from imgaug.augmentables.segmaps import SegmentationMapsOnImage
 
 current_dir = os.path.dirname(os.path.abspath(
             inspect.getfile(inspect.currentframe())))
@@ -45,6 +46,21 @@ class Dataset2D(BaseDataset):
         self.mode = mode
         assert cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE % 64 == 0, \
                     "Bounding Box size has to be divisible by 64!"
+
+        self.instance_mask_input = (
+            mode == 'KeypointDetect'
+            and getattr(cfg.KEYPOINTDETECT, 'INSTANCE_MASK_INPUT', False))
+
+        # When INSTANCE_MASK_INPUT is on, KeypointDetect iterates per annotation
+        # (so each fly in a multi-fly frame is seen independently) rather than
+        # per image. Build a flat [(image_id, ann_idx)] index once at init.
+        self.ann_index = None
+        if self.instance_mask_input:
+            self.ann_index = []
+            for img_id in self.image_ids:
+                anns = self.imgToAnns.get(img_id, [])
+                for j in range(len(anns)):
+                    self.ann_index.append((img_id, j))
 
         img = self._load_image(0)
         width, height = img.shape[1], img.shape[0]
@@ -184,56 +200,138 @@ class Dataset2D(BaseDataset):
 
 
     def _get_item_keypoints(self, idx):
-        img = self._load_image(idx)
-        bboxs, keypoints = self._load_annotations(idx)
-        animal_size = np.max([bboxs[0][3]-bboxs[0][1], bboxs[0][2]-bboxs[0][0]])
-        bbox_hw = int(self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE/2)
-        center_y = min(max(bbox_hw, int((bboxs[0][1]+int(bboxs[0][3]))/2)),
-                    img.shape[0]-bbox_hw)
-        center_x = min(max(bbox_hw, int((bboxs[0][0]+int(bboxs[0][2]))/2)),
-                    img.shape[1]-bbox_hw)
-        img = img[center_y-bbox_hw:center_y+bbox_hw,
-                  center_x-bbox_hw:center_x+bbox_hw, :]
-        for i in range(0, keypoints.shape[1],3):
-            keypoints[0,i] += -center_x+bbox_hw
-            keypoints[0,i+1] += -center_y+bbox_hw
+        if self.instance_mask_input:
+            image_id, target_ann_idx = self.ann_index[idx]
+            img = self._load_image(image_id, is_id=True)
+            bboxs, keypoints = self._load_annotations(image_id, is_id=True)
+            mask_bundle = self._load_instance_masks(image_id, is_id=True)
+        else:
+            image_id = None
+            target_ann_idx = 0
+            img = self._load_image(idx)
+            bboxs, keypoints = self._load_annotations(idx)
+            mask_bundle = None
+
+        bbox = bboxs[target_ann_idx]
+        animal_size = np.max([bbox[3] - bbox[1], bbox[2] - bbox[0]])
+        bbox_hw = int(self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE / 2)
+        center_y = min(max(bbox_hw, int((bbox[1] + int(bbox[3])) / 2)),
+                    img.shape[0] - bbox_hw)
+        center_x = min(max(bbox_hw, int((bbox[0] + int(bbox[2])) / 2)),
+                    img.shape[1] - bbox_hw)
+
+        # Build distractor mask and target mask in full-image coords before
+        # cropping, so we can replace distractor pixels with a gray fill in
+        # the crop and feed the target mask as a 4th input channel.
+        target_mask_crop = None
+        if self.instance_mask_input and mask_bundle is not None:
+            full_h, full_w = img.shape[:2]
+            masks = mask_bundle.get('masks')
+            matched = mask_bundle.get('matched')
+            extra_masks = mask_bundle.get('extra_masks')
+
+            distractor_full = np.zeros((full_h, full_w), dtype=bool)
+            if masks is not None and masks.shape[0] > 0:
+                for j in range(masks.shape[0]):
+                    if j == target_ann_idx:
+                        continue
+                    if matched is None or matched[j]:
+                        distractor_full |= masks[j]
+            if extra_masks is not None and extra_masks.shape[0] > 0:
+                for j in range(extra_masks.shape[0]):
+                    distractor_full |= extra_masks[j]
+
+            # Exclude any distractor pixels that overlap the target mask so we
+            # don't accidentally gray out part of the target fly.
+            if (masks is not None and masks.shape[0] > target_ann_idx
+                    and (matched is None or matched[target_ann_idx])):
+                distractor_full &= ~masks[target_ann_idx]
+
+            distractor_crop = distractor_full[center_y - bbox_hw:center_y + bbox_hw,
+                                              center_x - bbox_hw:center_x + bbox_hw]
+            # Replace distractor pixels with the crop's mean color so the net
+            # sees "no other fly here" and must rely on RGB + the target mask
+            # channel to localize this fly's keypoints.
+            if distractor_crop.any():
+                # Work on the full image crop now.
+                img_crop = img[center_y - bbox_hw:center_y + bbox_hw,
+                               center_x - bbox_hw:center_x + bbox_hw, :].copy()
+                mean_color = img_crop.mean(axis=(0, 1))
+                img_crop[distractor_crop] = mean_color
+                img = img_crop
+            else:
+                img = img[center_y - bbox_hw:center_y + bbox_hw,
+                          center_x - bbox_hw:center_x + bbox_hw, :]
+
+            if (masks is not None and masks.shape[0] > target_ann_idx
+                    and (matched is None or matched[target_ann_idx])):
+                target_mask_crop = masks[target_ann_idx,
+                                         center_y - bbox_hw:center_y + bbox_hw,
+                                         center_x - bbox_hw:center_x + bbox_hw]
+                target_mask_crop = target_mask_crop.astype(np.uint8)
+            else:
+                target_mask_crop = np.zeros(
+                    (self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE,
+                     self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE), dtype=np.uint8)
+        else:
+            img = img[center_y - bbox_hw:center_y + bbox_hw,
+                      center_x - bbox_hw:center_x + bbox_hw, :]
+
+        kp_row = keypoints[target_ann_idx].copy()
+        for i in range(0, len(kp_row), 3):
+            kp_row[i] += -center_x + bbox_hw
+            kp_row[i + 1] += -center_y + bbox_hw
 
         if self.set_name == 'train':
             keypoints_iaa = KeypointsOnImage([
-                        Keypoint(x=keypoints[0][i], y=keypoints[0][i+1])
-                        for i in range(0,len(keypoints[0]),3)],
+                        Keypoint(x=kp_row[i], y=kp_row[i + 1])
+                        for i in range(0, len(kp_row), 3)],
                         shape=(self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE,
-                        self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE,3))
-            img, keypoints_aug = self.augpipe(image=img,
-                        keypoints = keypoints_iaa)
-            for i,point in enumerate(keypoints_aug.keypoints):
-                keypoints[0,i*3] = point.x
-                keypoints[0,i*3+1] = point.y
-
-        keypoints_new = np.empty_like(keypoints)
-        for i,keypoint in enumerate(keypoints.reshape((-1,3))):
-            if keypoint[0] < 0 or keypoint[1] < 0 \
-                    or keypoint[0] >= self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE \
-                    or keypoint[1] >= self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE:
-                keypoints_new[:,i*3:i*3+2] = 0
+                        self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE, 3))
+            if target_mask_crop is not None:
+                segmap = SegmentationMapsOnImage(
+                    target_mask_crop, shape=img.shape)
+                img, keypoints_aug, segmap_aug = self.augpipe(
+                    image=img, keypoints=keypoints_iaa,
+                    segmentation_maps=segmap)
+                target_mask_crop = segmap_aug.get_arr().astype(np.uint8)
             else:
-                keypoints_new[:,i*3:i*3+2] = keypoints[:,i*3:i*3+2]
-        keypoints = keypoints_new
+                img, keypoints_aug = self.augpipe(image=img,
+                            keypoints=keypoints_iaa)
+            for i, point in enumerate(keypoints_aug.keypoints):
+                kp_row[i * 3] = point.x
+                kp_row[i * 3 + 1] = point.y
 
-        joints = np.zeros((1,self.num_keypoints[0], 3))
-        joints[0, :self.num_keypoints[0], :3] = np.array(
-                    keypoints[0]).reshape([-1, 3])
+        kp_out = kp_row.copy()
+        for i, keypoint in enumerate(kp_row.reshape((-1, 3))):
+            if (keypoint[0] < 0 or keypoint[1] < 0
+                    or keypoint[0] >= self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE
+                    or keypoint[1] >= self.cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE):
+                kp_out[i * 3:i * 3 + 2] = 0
+        kp_out = kp_out.reshape(1, -1)
+
+        joints = np.zeros((1, self.num_keypoints[0], 3))
+        joints[0, :self.num_keypoints[0], :3] = kp_out[0].reshape([-1, 3])
         joints_list = [joints.copy() for _ in range(2)]
         target_list = list()
         for scale_id in range(2):
             target_t = self.heatmap_generators[scale_id](joints_list[scale_id],
                         animal_size)
             target_list.append(target_t.astype(np.float32))
-        sample = [img, target_list, keypoints]
-        sample =  self.transform(sample)
+
+        if self.instance_mask_input:
+            mask_channel = (target_mask_crop.astype(np.float32)
+                            if target_mask_crop is not None
+                            else np.zeros(img.shape[:2], dtype=np.float32))
+            img = np.concatenate([img, mask_channel[..., None]], axis=-1)
+
+        sample = [img, target_list, kp_out]
+        sample = self.transform(sample)
         return sample
 
     def __len__(self):
+        if self.instance_mask_input and self.ann_index is not None:
+            return len(self.ann_index)
         return len(self.image_ids)
 
 
@@ -291,8 +389,15 @@ class Normalizer(object):
     def __call__(self, sample):
         image, heatmaps = sample[0], sample[1]
         keypoints = sample[2]
-        return [(image.astype(np.float32) - self.mean) / self.std,
-                    heatmaps, keypoints]
+        image = image.astype(np.float32)
+        # Normalize RGB channels; pass the optional mask channel through as
+        # a {0,1} float so the first conv learns to fuse it with RGB.
+        rgb = (image[..., :3] - self.mean) / self.std
+        if image.shape[-1] > 3:
+            image = np.concatenate([rgb, image[..., 3:]], axis=-1)
+        else:
+            image = rgb
+        return [image, heatmaps, keypoints]
 
 
 class HeatmapGenerator():

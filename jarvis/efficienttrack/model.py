@@ -25,11 +25,13 @@ class EfficientTrackBackbone(nn.Module):
     :param model_size: Scaling factor of the network (small, medium, large)..
     :type model_size: str
     """
-    def __init__(self, cfg, model_size='small', output_channels = 1, **kwargs):
+    def __init__(self, cfg, model_size='small', output_channels = 1,
+                 in_channels=3, **kwargs):
         super(EfficientTrackBackbone, self).__init__()
         self.num_groups = 8
         self.cfg = cfg
         self.model_size = model_size
+        self.in_channels = in_channels
 
         if model_size == 'small':
             self.backbone_compound_coef = 0
@@ -76,7 +78,8 @@ class EfficientTrackBackbone(nn.Module):
                     self.conv_channel_coef)
                     for _ in range(1,self.fpn_cell_repeats)])
 
-        self.backbone_net = EfficientNet(self.backbone_compound_coef)
+        self.backbone_net = EfficientNet(self.backbone_compound_coef,
+                                         in_channels=self.in_channels)
 
         self.swish = SiLU()
         self.upsample3 = nn.Upsample(scale_factor = 4, mode = 'nearest')
@@ -514,9 +517,10 @@ class EfficientNet(nn.Module):
     :type model_size: int
     :return: Feature Maps at 1/16, 1/32, 1/64 of the original resolution.
     """
-    def __init__(self, compound_coef):
+    def __init__(self, compound_coef, in_channels=3):
         super(EfficientNet, self).__init__()
-        model = EffNet.from_pretrained(f'efficientnet-b{compound_coef}')
+        model = EffNet.from_pretrained(f'efficientnet-b{compound_coef}',
+                                       in_channels=in_channels)
         self.model = model
         self.drop_connect_rate = self.model._global_params.drop_connect_rate
         self.save_idxs = []

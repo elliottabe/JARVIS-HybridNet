@@ -68,6 +68,12 @@ _C.KEYPOINTDETECT.MAX_LEARNING_RATE = 0.003
 _C.KEYPOINTDETECT.NUM_EPOCHS = 100
 _C.KEYPOINTDETECT.CHECKPOINT_SAVE_INTERVAL = 10
 _C.KEYPOINTDETECT.VAL_INTERVAL = 1
+# When true, KeypointDetect samples per-annotation (not per-image), hard-masks
+# distractor flies inside the crop, and feeds the target fly's SAM3 mask as a
+# 4th input channel. Requires sam3_masks/<split>/… populated by
+# tools/sam3_label_masks.py.
+_C.KEYPOINTDETECT.INSTANCE_MASK_INPUT = False
+_C.KEYPOINTDETECT.SAM3_MASKS_DIRNAME = 'sam3_masks'
 
 _C.AUGMENTATION = CN()
 _C.AUGMENTATION.COLOR_MANIPULATION = CN()

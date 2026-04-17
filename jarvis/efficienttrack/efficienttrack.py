@@ -48,9 +48,16 @@ class EfficientTrack:
             self.cfg = self.main_cfg.CENTERDETECT
         else:
             self.cfg = self.main_cfg.KEYPOINTDETECT
+        in_channels = 3
+        if mode in ('KeypointDetect', 'KeypointDetectInference') and \
+                getattr(self.main_cfg.KEYPOINTDETECT,
+                        'INSTANCE_MASK_INPUT', False):
+            in_channels = 4
+        self.in_channels = in_channels
         self.model = EfficientTrackBackbone(self.cfg,
                     model_size=self.cfg.MODEL_SIZE,
-                    output_channels = self.cfg.NUM_JOINTS)
+                    output_channels = self.cfg.NUM_JOINTS,
+                    in_channels = in_channels)
         if mode  == 'KeypointDetect' or mode == 'CenterDetect':
             if run_name == None:
                 run_name = "Run_" + time.strftime("%Y%m%d-%H%M%S")
@@ -103,6 +110,7 @@ class EfficientTrack:
                     pretrained_dict = {k: v for k, v in pretrained_dict.items()
                                 if not k in ['final_conv1.weight',
                                 'final_conv2.weight']}
+                self._expand_conv_stem(pretrained_dict)
                 self.model.load_state_dict(pretrained_dict, strict=False)
                 clp.info(f'Successfully loaded weights: {weights_path}')
                 return True
@@ -127,12 +135,38 @@ class EfficientTrack:
                         'first_conv.pointwise_conv.bias',
                         'first_conv.gn.weight', 'first_conv.gn.bias',
                         'first_conv.pointwise_conv.weight']}
+            self._expand_conv_stem(pretrained_dict)
             self.model.load_state_dict(pretrained_dict, strict=False)
             clp.info(f'Successfully loaded EcoSet weights: {weights_path}')
             return True
         else:
             clp.warning(f'Could not load EcoSet weights: {weights_path}')
             return False
+
+
+    def _expand_conv_stem(self, pretrained_dict):
+        """Expand a 3-channel pretrained `_conv_stem` to match a 4-channel
+        model by copying the RGB filters into channels [:, :3] and
+        zero-initializing channel 3 (the instance-mask channel). No-op if
+        shapes already match or the key is absent.
+        """
+        key = 'backbone_net.model._conv_stem.weight'
+        if key not in pretrained_dict:
+            return
+        target_w = self.model.state_dict().get(key)
+        if target_w is None:
+            return
+        src_w = pretrained_dict[key]
+        if src_w.shape == target_w.shape:
+            return
+        if src_w.shape[1] == 3 and target_w.shape[1] == 4 and \
+                src_w.shape[0] == target_w.shape[0] and \
+                src_w.shape[2:] == target_w.shape[2:]:
+            expanded = torch.zeros_like(target_w)
+            expanded[:, :3] = src_w
+            pretrained_dict[key] = expanded
+            clp.info('Expanded pretrained _conv_stem 3->4 channels '
+                     '(ch3 zero-init)')
 
 
     def load_pose_pretrain(self, pose):
@@ -154,6 +188,7 @@ class EfficientTrack:
                 pretrained_dict = {k: v for k, v in pretrained_dict.items()
                             if not k in ['final_conv1.weight',
                             'final_conv2.weight', 'deconv1.weight']}
+            self._expand_conv_stem(pretrained_dict)
             self.model.load_state_dict(pretrained_dict, strict=False)
             clp.info(f'Successfully loaded {pose} weights: {weights_path}')
             return True

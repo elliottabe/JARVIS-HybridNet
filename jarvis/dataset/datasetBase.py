@@ -141,3 +141,29 @@ class BaseDataset(Dataset):
         :return: anns (object array) : loaded ann objects
         """
         return [self.annotations[id] for id in ids]
+
+
+    def _load_instance_masks(self, image_index, is_id=False):
+        """Load SAM3-generated per-annotation instance masks for this image.
+
+        Expects cached .npz files at
+          <root_dir>/<sam3_dirname>/<set_name>/<file_name_no_ext>.npz
+        produced by tools/sam3_label_masks.py. Returns a dict of arrays with
+        keys matching the npz, or None if the cache file is missing.
+
+        Array order is aligned with `_load_annotations` (same COCO iteration
+        order); `ann_ids` is included for safety-check mapping.
+        """
+        sam_dirname = getattr(self.cfg.KEYPOINTDETECT, 'SAM3_MASKS_DIRNAME',
+                              'sam3_masks')
+        if is_id:
+            file_name = self.imgs[image_index]['file_name']
+        else:
+            file_name = self.imgs[self.image_ids[image_index]]['file_name']
+        stem, _ = os.path.splitext(file_name)
+        path = os.path.join(self.root_dir, sam_dirname, self.set_name,
+                            stem + '.npz')
+        if not os.path.isfile(path):
+            return None
+        with np.load(path) as z:
+            return {k: z[k] for k in z.files}
