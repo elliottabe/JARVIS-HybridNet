@@ -601,6 +601,23 @@ def main():
     ap.add_argument('--sam3-gpu', type=int, default=1,
                     help='GPU index for SAM3 (keep JARVIS on a separate GPU).')
     ap.add_argument('--sam3-text', default='insect')
+    ap.add_argument('--sam3-version', default='sam3',
+                    choices=['sam3', 'sam3.1'],
+                    help='SAM3 model version. sam3.1 uses the multiplex '
+                         'video predictor (~2× faster with --sam3-compile) '
+                         'but requires torch>=2.6 (bool-sort on CUDA) and '
+                         'a working flash_attn_3 wheel (or use_fa3=False).')
+    ap.add_argument('--sam3-compile', dest='sam3_compile',
+                    action='store_true', default=True,
+                    help='torch.compile the SAM 3.1 multiplex backbones '
+                         '(default on; ignored for sam3 base).')
+    ap.add_argument('--no-sam3-compile', dest='sam3_compile',
+                    action='store_false',
+                    help='Disable torch.compile for SAM 3.1 (useful for '
+                         'single-bout dev runs — skips ~30–60s warm-up).')
+    ap.add_argument('--sam3-checkpoint', default=None,
+                    help='Explicit SAM3 checkpoint path. If omitted, the '
+                         'checkpoint auto-downloads from HuggingFace.')
     ap.add_argument('--bouts', default=None,
                     help='Comma-separated bout_idx values to restrict to.')
     ap.add_argument('--save-masks', action='store_true',
@@ -653,8 +670,13 @@ def main():
     def _get_sam3():
         nonlocal sam3
         if sam3 is None:
-            sam3 = SAM3VideoTracker(gpu_id=args.sam3_gpu,
-                                    text_prompt=args.sam3_text)
+            sam3 = SAM3VideoTracker(
+                gpu_id=args.sam3_gpu,
+                text_prompt=args.sam3_text,
+                sam3_version=args.sam3_version,
+                compile=args.sam3_compile,
+                checkpoint_path=args.sam3_checkpoint,
+            )
         return sam3
 
     for bout in bouts:

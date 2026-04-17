@@ -25,7 +25,7 @@ if SAM3_PATH not in sys.path:
 
 import gc
 
-from sam3.model_builder import build_sam3_video_predictor
+from sam3.model_builder import build_sam3_predictor, build_sam3_video_predictor
 
 
 class BoutMasks:
@@ -212,19 +212,52 @@ class SAM3VideoTracker:
     Args:
         gpu_id: GPU index for SAM3 (default: 1 to keep JARVIS on GPU 0)
         text_prompt: text description for detection
-        apply_temporal_disambiguation: whether to use hotstart delay
+        apply_temporal_disambiguation: base-SAM3 hotstart-delay toggle
+            (ignored by SAM 3.1 multiplex, which always applies it)
+        sam3_version: 'sam3.1' (multiplex, default) or 'sam3' (base)
+        compile: torch.compile the multiplex backbones (SAM 3.1 only)
+        max_num_objects: multiplex max tracked objects (SAM 3.1 only)
+        checkpoint_path: explicit ckpt path; None = auto-download from HF
+        use_fa3: enable FlashAttention-3 kernels (SAM 3.1 only). Default
+            False because the prebuilt `flash_attn_3` wheel shipped with
+            this env has an ABI mismatch; the FA2 fallback still works.
     """
 
-    def __init__(self, gpu_id=1, text_prompt='fly',
-                 apply_temporal_disambiguation=False):
+    def __init__(self, gpu_id=1, text_prompt='insect',
+                 apply_temporal_disambiguation=False,
+                 sam3_version='sam3.1', compile=True,
+                 max_num_objects=16, checkpoint_path=None,
+                 use_fa3=False):
         self.gpu_id = gpu_id
         self.text_prompt = text_prompt
+        self.sam3_version = sam3_version
 
-        print(f"  Loading SAM3 video predictor on cuda:{gpu_id}...")
-        self.predictor = build_sam3_video_predictor(
-            gpus_to_use=[gpu_id],
-            apply_temporal_disambiguation=apply_temporal_disambiguation,
-        )
+        print(f"  Loading SAM3 video predictor ({sam3_version}) "
+              f"on cuda:{gpu_id}...")
+        # Multiplex places weights on the current CUDA device (no
+        # gpus_to_use kwarg), so pin the device for construction.
+        with torch.cuda.device(gpu_id):
+            if sam3_version == 'sam3.1':
+                self.predictor = build_sam3_predictor(
+                    version='sam3.1',
+                    compile=compile,
+                    warm_up=False,
+                    max_num_objects=max_num_objects,
+                    multiplex_count=16,
+                    checkpoint_path=checkpoint_path,
+                    use_fa3=use_fa3,
+                )
+                # Async loader spawns a daemon thread whose current CUDA
+                # device defaults to cuda:0, placing frames there while
+                # the model lives on cuda:{gpu_id}. Force sync loading so
+                # the torch.cuda.device(gpu_id) context in process_bout
+                # governs frame placement too.
+                self.predictor.async_loading_frames = False
+            else:
+                self.predictor = build_sam3_video_predictor(
+                    gpus_to_use=[gpu_id],
+                    apply_temporal_disambiguation=apply_temporal_disambiguation,
+                )
         print(f"  SAM3 video predictor loaded.")
 
     def _extract_bout_frames(self, video_path, frame_start, num_frames,
@@ -264,75 +297,83 @@ class SAM3VideoTracker:
         # Create temp directory for frame extraction
         tmp_base = tempfile.mkdtemp(prefix='sam3_bout_')
 
+        # Multiplex (SAM 3.1) creates helper tensors (token ids, pos
+        # embeddings) on the current CUDA device. JARVIS runs on cuda:0
+        # and flips the default, so pin the SAM3 GPU for the whole bout.
         try:
-            for cam_idx, video_path in enumerate(video_paths):
-                cam_name = os.path.splitext(
-                    os.path.basename(video_path)
-                )[0]
-                cam_dir = os.path.join(tmp_base, cam_name)
-
-                # Extract bout frames to JPEG folder
-                print(f"    Extracting frames for {cam_name}...")
-                self._extract_bout_frames(
-                    video_path, frame_start, num_frames, cam_dir
-                )
-
-                # Start SAM3 session
-                response = self.predictor.handle_request({
-                    'type': 'start_session',
-                    'resource_path': cam_dir,
-                })
-                session_id = response['session_id']
-
-                # Detect flies on frame 0
-                response = self.predictor.handle_request({
-                    'type': 'add_prompt',
-                    'session_id': session_id,
-                    'frame_index': 0,
-                    'text': self.text_prompt,
-                })
-                outputs = response['outputs']
-                if outputs and 'out_obj_ids' in outputs:
-                    bout_masks.set_camera_masks(
-                        cam_idx, 0,
-                        outputs['out_obj_ids'],
-                        outputs['out_binary_masks'],
-                        outputs.get('out_probs', np.array([])),
-                    )
-                    n_det = len(outputs['out_obj_ids'])
-                    print(f"    {cam_name}: {n_det} flies detected on frame 0")
-                else:
-                    print(f"    {cam_name}: no detections on frame 0")
-
-                # Propagate through all frames
-                print(f"    {cam_name}: propagating masks...")
-                for response in self.predictor.handle_stream_request({
-                    'type': 'propagate_in_video',
-                    'session_id': session_id,
-                    'propagation_direction': 'forward',
-                }):
-                    fi = response['frame_index']
-                    out = response['outputs']
-                    if out and 'out_obj_ids' in out:
-                        bout_masks.set_camera_masks(
-                            cam_idx, fi,
-                            out['out_obj_ids'],
-                            out['out_binary_masks'],
-                            out.get('out_probs', np.array([])),
-                        )
-
-                # Close session
-                self.predictor.handle_request({
-                    'type': 'close_session',
-                    'session_id': session_id,
-                })
-                print(f"    {cam_name}: done")
-
+            with torch.cuda.device(self.gpu_id):
+                self._process_bout_inner(
+                    video_paths, frame_start, num_frames, num_animals,
+                    bout_masks, tmp_base)
         finally:
-            # Clean up temp frames
             shutil.rmtree(tmp_base, ignore_errors=True)
 
         return bout_masks
+
+    def _process_bout_inner(self, video_paths, frame_start, num_frames,
+                            num_animals, bout_masks, tmp_base):
+        # Thread-local CUDA current device — belt-and-suspenders alongside
+        # the torch.cuda.device(self.gpu_id) context wrapping this call,
+        # so any sam3 internals that resolve torch.device("cuda") pick up
+        # the right GPU.
+        torch.cuda.set_device(self.gpu_id)
+        for cam_idx, video_path in enumerate(video_paths):
+            cam_name = os.path.splitext(
+                os.path.basename(video_path)
+            )[0]
+            cam_dir = os.path.join(tmp_base, cam_name)
+
+            print(f"    Extracting frames for {cam_name}...")
+            self._extract_bout_frames(
+                video_path, frame_start, num_frames, cam_dir
+            )
+
+            response = self.predictor.handle_request({
+                'type': 'start_session',
+                'resource_path': cam_dir,
+            })
+            session_id = response['session_id']
+
+            response = self.predictor.handle_request({
+                'type': 'add_prompt',
+                'session_id': session_id,
+                'frame_index': 0,
+                'text': self.text_prompt,
+            })
+            outputs = response['outputs']
+            if outputs and 'out_obj_ids' in outputs:
+                bout_masks.set_camera_masks(
+                    cam_idx, 0,
+                    outputs['out_obj_ids'],
+                    outputs['out_binary_masks'],
+                    outputs.get('out_probs', np.array([])),
+                )
+                n_det = len(outputs['out_obj_ids'])
+                print(f"    {cam_name}: {n_det} flies detected on frame 0")
+            else:
+                print(f"    {cam_name}: no detections on frame 0")
+
+            print(f"    {cam_name}: propagating masks...")
+            for response in self.predictor.handle_stream_request({
+                'type': 'propagate_in_video',
+                'session_id': session_id,
+                'propagation_direction': 'forward',
+            }):
+                fi = response['frame_index']
+                out = response['outputs']
+                if out and 'out_obj_ids' in out:
+                    bout_masks.set_camera_masks(
+                        cam_idx, fi,
+                        out['out_obj_ids'],
+                        out['out_binary_masks'],
+                        out.get('out_probs', np.array([])),
+                    )
+
+            self.predictor.handle_request({
+                'type': 'close_session',
+                'session_id': session_id,
+            })
+            print(f"    {cam_name}: done")
 
 
 class SAM3StreamingTracker:

@@ -64,6 +64,13 @@ def main():
     ap.add_argument('--kp-weights', default=None)
     ap.add_argument('--hybridnet-weights', default=None)
     ap.add_argument('--sam3-text', default='insect')
+    ap.add_argument('--sam3-version', default='sam3',
+                    choices=['sam3', 'sam3.1'])
+    ap.add_argument('--sam3-compile', dest='sam3_compile',
+                    action='store_true', default=True)
+    ap.add_argument('--no-sam3-compile', dest='sam3_compile',
+                    action='store_false')
+    ap.add_argument('--sam3-checkpoint', default=None)
     ap.add_argument('--save-masks', action='store_true')
     ap.add_argument('--reuse-masks', action='store_true')
     ap.add_argument('--save-overlays-every', type=int, default=0)
@@ -120,6 +127,11 @@ def main():
                           ('--hybridnet-weights', args.hybridnet_weights)]:
             if val is not None:
                 cmd += [flag, val]
+        cmd += ['--sam3-version', args.sam3_version]
+        if not args.sam3_compile:
+            cmd += ['--no-sam3-compile']
+        if args.sam3_checkpoint is not None:
+            cmd += ['--sam3-checkpoint', args.sam3_checkpoint]
         if args.save_masks:
             cmd += ['--save-masks']
         if args.reuse_masks:
