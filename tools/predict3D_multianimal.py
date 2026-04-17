@@ -601,7 +601,7 @@ def main():
     ap.add_argument('--sam3-gpu', type=int, default=1,
                     help='GPU index for SAM3 (keep JARVIS on a separate GPU).')
     ap.add_argument('--sam3-text', default='insect')
-    ap.add_argument('--sam3-version', default='sam3',
+    ap.add_argument('--sam3-version', default='sam3.1',
                     choices=['sam3', 'sam3.1'],
                     help='SAM3 model version. sam3.1 uses the multiplex '
                          'video predictor (~2× faster with --sam3-compile) '
