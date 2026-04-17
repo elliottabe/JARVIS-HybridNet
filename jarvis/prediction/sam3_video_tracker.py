@@ -328,10 +328,17 @@ class SAM3VideoTracker:
                 video_path, frame_start, num_frames, cam_dir
             )
 
-            response = self.predictor.handle_request({
+            start_req = {
                 'type': 'start_session',
                 'resource_path': cam_dir,
-            })
+            }
+            # SAM 3.1 multiplex keeps backbone/memory features in GPU
+            # memory for every propagated frame. On ~2000-frame bouts
+            # that pushes past a 48 GiB A6000. Push per-frame buffers
+            # to CPU RAM so VRAM stays bounded by the current frame.
+            if self.sam3_version == 'sam3.1':
+                start_req['offload_video_to_cpu'] = True
+            response = self.predictor.handle_request(start_req)
             session_id = response['session_id']
 
             response = self.predictor.handle_request({
