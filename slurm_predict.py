@@ -456,4 +456,7 @@ CUDA_VISIBLE_DEVICES=0 /home/eabe/miniconda3/envs/jarvis/bin/jarvis-local train 
 
 
 
+python slurm_predict.py --data_dir /gscratch/portia/eabe/data/Johnson_lab/Video_recordings/courtship/Session0 --bouts_root /gscratch/portia/eabe/data/Johnson_lab/courtship/Session0_bouts_04152026_bouts --stage_suffix $(date +%m%d%Y) --project red_data_unified --predict_script tools/predict3D_multianimal_shard.py --num_gpus 4 --mem 128 --cpus 16 --time 1-00:00:00 --dataset courtship
+
+python tools/predict3D_multianimal.py --project red_data_unified --session /gscratch/portia/eabe/data/Johnson_lab/Video_recordings/courtship/Session0/2025_10_20_13_20_04 --bouts-csv courtship_bouts_unified_summary.csv --out /gscratch/portia/eabe/data/Johnson_lab/Video_recordings/courtship/Session0/2025_10_20_13_20_04/Predictions_3D_34659165   --bouts 29 --save-masks --save-clips 
 '''

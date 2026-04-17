@@ -16,6 +16,7 @@ import csv
 import os
 import subprocess
 import sys
+import time
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -102,12 +103,58 @@ def main():
         print(f'  shard {i} (gpu {2*i}:{2*i+1}): {len(s)} bouts '
               f'→ {s[:10]}{"..." if len(s) > 10 else ""}', flush=True)
 
+    # Populate the kernel pagecache with the heavy .py files each shard
+    # cold-imports, so parallel shard imports don't deadlock on GPFS
+    # ThCond::internalWait waiting for the same inodes. One sequential
+    # import pass here turns every later shard import into a pagecache
+    # hit instead of a GPFS metadata round-trip.
+    print('[shard] pre-warming imports (torch/pandas/cv2/sam3/jarvis)...',
+          flush=True)
+    t0 = time.time()
+    # Import order matters: cv2 must load BEFORE pandas/matplotlib, otherwise
+    # pandas' import chain binds /lib64/libstdc++.so.6 (CXXABI_1.3.14) into
+    # the process and cv2's later load fails with
+    #   version `CXXABI_1.3.15' not found (required by cv2.so)
+    # Mirrors predict3D_multianimal.py which imports cv2 at the top.
+    # Each import is isolated so a single failure still warms the rest.
+    prewarm_src = (
+        'import sys; sys.path.insert(0, ' + repr(ROOT) + ')\n'
+        'for m in ('
+        '"cv2", "numpy", "pandas", "matplotlib", "matplotlib.pyplot",'
+        '"torch", "torch.nn.functional",'
+        '"sam3", "sam3.model_builder",'
+        '"jarvis.config.project_manager",'
+        '"jarvis.efficienttrack.efficienttrack",'
+        '"jarvis.hybridnet.hybridnet",'
+        '"jarvis.utils.reprojection",'
+        '"jarvis.prediction.sam3_video_tracker"'
+        '):\n'
+        '    try:\n'
+        '        __import__(m)\n'
+        '    except Exception as _e:\n'
+        '        print(f"[prewarm] {m}: {_e}", flush=True)\n'
+    )
+    try:
+        subprocess.run([sys.executable, '-c', prewarm_src],
+                       check=True, timeout=600)
+        print(f'[shard] pre-warm done in {time.time() - t0:.1f}s',
+              flush=True)
+    except Exception as e:
+        print(f'[shard] pre-warm failed ({e}); continuing anyway',
+              flush=True)
+
     # Inherit env, override CUDA_VISIBLE_DEVICES per subprocess so each one
     # sees exactly two GPUs (JARVIS=0, SAM3=1 from the subprocess's view).
+    # Stagger launches so shards don't race on GPFS metadata tokens during
+    # Python import on cold nodes — simultaneous launches have deadlocked
+    # in ThCond::internalWait for many minutes before any log output.
+    SHARD_LAUNCH_STAGGER_S = 15
     procs = []
     for i, s in enumerate(shards):
         if not s:
             continue
+        if procs:
+            time.sleep(SHARD_LAUNCH_STAGGER_S)
         env = os.environ.copy()
         env['CUDA_VISIBLE_DEVICES'] = f'{2 * i},{2 * i + 1}'
 
