@@ -72,27 +72,60 @@ class BoutMasks:
 
     def assign_identities(self, repro_tool, num_animals=2):
         """
-        Establish cross-camera identity using multi-view triangulation
-        on the first frame where all cameras have detections.
+        Establish cross-camera identity using multi-view triangulation.
 
         SAM3 assigns independent obj_ids per camera. This method finds
         which obj_id in each camera corresponds to the same physical fly.
+
+        Anchor-frame selection: pick the frame (from a scan across the
+        bout) that maximizes the minimum per-camera pairwise centroid
+        separation between the ``num_animals`` top-scoring masks. A
+        well-separated anchor frame makes the downstream naive Step-1
+        triangulation in ``assign_peaks_across_cameras`` well-conditioned
+        and eliminates the per-camera identity swaps that occur when two
+        flies are close and SAM3 scores flip order across runs.
+
+        Per-camera obj ordering uses a deterministic tiebreak
+        ``(-score, cx, cy, obj_id)`` so identical SAM3 outputs produce
+        identical peak tensors across GPUs.
         """
         from jarvis.prediction.multi_peak import assign_peaks_across_cameras
 
-        # Find first frame where most cameras have >= num_animals detections
+        # Score candidate frames by the minimum per-camera pairwise
+        # centroid separation of the top-num_animals masks (in pixels).
+        # Larger = better-conditioned anchor.
+        def _frame_separation(f):
+            min_sep = float('inf')
+            cams_ok = 0
+            for cam in range(self.num_cameras):
+                fd = self.masks[cam][f]
+                if len(fd) < num_animals:
+                    continue
+                cams_ok += 1
+                top = sorted(
+                    fd.items(),
+                    key=lambda x: (-x[1]['score'],
+                                   float(x[1]['centroid'][0]),
+                                   float(x[1]['centroid'][1]),
+                                   int(x[0])),
+                )[:num_animals]
+                cents = np.stack([d['centroid'] for _, d in top])
+                for i in range(num_animals):
+                    for j in range(i + 1, num_animals):
+                        d = float(np.linalg.norm(cents[i] - cents[j]))
+                        if d < min_sep:
+                            min_sep = d
+            return cams_ok, (min_sep if min_sep < float('inf') else 0.0)
+
+        scan_limit = min(self.num_frames, 200)
         best_frame = 0
-        best_count = 0
-        for f in range(min(self.num_frames, 30)):  # check first 30 frames
-            count = sum(
-                1 for cam in range(self.num_cameras)
-                if len(self.masks[cam][f]) >= num_animals
-            )
-            if count > best_count:
-                best_count = count
+        best_key = (-1, -1.0)  # (cams_ok, min_sep)
+        for f in range(scan_limit):
+            cams_ok, sep = _frame_separation(f)
+            key = (cams_ok, sep)
+            if key > best_key:
+                best_key = key
                 best_frame = f
-            if count == self.num_cameras:
-                break
 
         # Build peak tensors from SAM3 centroids at best_frame.
         # `assign_peaks_across_cameras` bmm's these against the reproTool's
@@ -110,16 +143,23 @@ class BoutMasks:
             frame_data = self.masks[cam][best_frame]
             if not frame_data:
                 continue
-            # Sort by score descending
+            # Deterministic tiebreak so the same SAM3 outputs produce
+            # identical per-camera ordering across GPUs: sort by
+            # (-score, cx, cy, obj_id).
             sorted_objs = sorted(
                 frame_data.items(),
-                key=lambda x: x[1]['score'],
-                reverse=True,
+                key=lambda x: (-x[1]['score'],
+                               float(x[1]['centroid'][0]),
+                               float(x[1]['centroid'][1]),
+                               int(x[0])),
             )[:k]
             for pi, (obj_id, data) in enumerate(sorted_objs):
                 peaks[pi, cam] = torch.tensor(data['centroid'])
                 maxvals[pi, cam, 0] = data['score'] * 255
                 cam_obj_ids[cam].append(obj_id)
+
+        print(f"  [assign_identities] anchor frame={best_frame} "
+              f"(cams_ok={best_key[0]}, min_sep={best_key[1]:.1f}px)")
 
         # Use existing multi-peak assignment
         # downsampling_scale=0.5 so *2 scaling is identity (centroids in pixels)
