@@ -94,10 +94,14 @@ class BoutMasks:
             if count == self.num_cameras:
                 break
 
-        # Build peak tensors from SAM3 centroids at best_frame
+        # Build peak tensors from SAM3 centroids at best_frame.
+        # `assign_peaks_across_cameras` bmm's these against the reproTool's
+        # camera matrices, which live on CUDA, so place them on the same
+        # device as the reproTool to avoid a mixed-device RuntimeError.
+        dev = repro_tool.cameraMatrices.device
         k = num_animals
-        peaks = torch.zeros(k, self.num_cameras, 2)
-        maxvals = torch.zeros(k, self.num_cameras, 1)
+        peaks = torch.zeros(k, self.num_cameras, 2, device=dev)
+        maxvals = torch.zeros(k, self.num_cameras, 1, device=dev)
 
         # Track which obj_ids correspond to which peak index per camera
         cam_obj_ids = [[] for _ in range(self.num_cameras)]
@@ -119,7 +123,7 @@ class BoutMasks:
 
         # Use existing multi-peak assignment
         # downsampling_scale=0.5 so *2 scaling is identity (centroids in pixels)
-        downsampling_scale = torch.tensor([0.5, 0.5])
+        downsampling_scale = torch.tensor([0.5, 0.5], device=dev)
         assignments = assign_peaks_across_cameras(
             peaks, maxvals, repro_tool, downsampling_scale,
             confidence_threshold=0.1,

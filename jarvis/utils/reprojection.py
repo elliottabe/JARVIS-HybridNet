@@ -52,8 +52,7 @@ class ReprojectionTool(nn.Module):
 
 
     def reprojectPoint(self, point3D):
-        ones = torch.ones([point3D.shape[0], 1],
-                    device=torch.device(self.device))
+        ones = torch.ones([point3D.shape[0], 1], device=point3D.device)
         point3D = torch.cat((point3D, ones), 1).unsqueeze(0)
         pointRepro = torch.matmul(point3D, self.cameraMatrices).permute(1, 2, 0)
         

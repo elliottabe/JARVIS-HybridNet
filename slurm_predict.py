@@ -86,6 +86,7 @@ def submit_predict(
     stage_dir=None,
     src_pred_dir=None,
     dataset=None,
+    predict_script_name='jarvis_batch_multi_animal.py',
 ):
     """Construct and submit a SLURM prediction job.
 
@@ -105,8 +106,12 @@ def submit_predict(
     nodelist_line = f"#SBATCH --nodelist={gpu_resource}" if gpu_resource else ""
 
     jarvis_root = os.path.dirname(os.path.abspath(__file__))
-    # predict_script = os.path.join(jarvis_root, "jarvis_batch_frame_range.py")
-    predict_script = os.path.join(jarvis_root, "jarvis_batch_multi_animal.py")
+    # Resolve the predict script relative to the repo root. Accepts a bare
+    # filename (legacy default) or a path like `tools/predict3D_multianimal_shard.py`.
+    if os.path.isabs(predict_script_name):
+        predict_script = predict_script_name
+    else:
+        predict_script = os.path.join(jarvis_root, predict_script_name)
 
     # Derive a short name from the recording folder
     recording_name = os.path.basename(str(video_folder).rstrip("/"))
@@ -294,6 +299,15 @@ Examples:
         "command substitution happens in your shell, not in Python.",
     )
     parser.add_argument(
+        "--predict_script",
+        type=str,
+        default="jarvis_batch_multi_animal.py",
+        help="Python script invoked inside each SLURM job. Path is relative "
+             "to the JARVIS-HybridNet root (or absolute). For Phase-4 Option-B "
+             "multi-animal 3D with SAM3 bout masks + bout sharding across GPU "
+             "pairs, use `tools/predict3D_multianimal_shard.py`.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print jobs that would be submitted without actually submitting",
@@ -409,6 +423,7 @@ Examples:
             src_pred_dir=src_pred_dir,
             dataset=args.dataset if src_pred_dir else None,
             time_limit=args.time,
+            predict_script_name=args.predict_script,
         )
         submitted_jobs.append((os.path.basename(recording_folder), job_id))
 
