@@ -172,6 +172,7 @@ def create_multi_animal_videos3D(
     output_dir=None,
     n_jobs=12,
     mask_file=None,
+    swap_flies=False,
 ):
     """
     Create visualization videos with multiple animals' skeletons overlaid.
@@ -191,6 +192,10 @@ def create_multi_animal_videos3D(
         output_dir: output directory (auto-generated if None)
         n_jobs: parallel jobs for frame reading
         mask_file: path to .npz file with SAM3 masks (None to skip)
+        swap_flies: if True, swap which CSV feeds fly0 vs fly1 AND which
+            mask channel is used for each, so the rendered labels/colors
+            track the true identity when the tracker mislabeled them.
+            Requires exactly two fly ids.
 
     Returns:
         output_dir path, or None on failure
@@ -236,9 +241,24 @@ def create_multi_animal_videos3D(
 
     # Load per-fly data
     fly_ids = sorted(data_csvs.keys())
+
+    if swap_flies:
+        if len(fly_ids) != 2:
+            raise ValueError(
+                f"swap_flies=True requires exactly 2 fly ids; got {fly_ids}"
+            )
+        a, b = fly_ids
+        effective_csvs = {a: data_csvs[b], b: data_csvs[a]}
+        mask_idx_of = {a: 1, b: 0}
+        print(f"  [swap_flies] {a} <- {data_csvs[b]}")
+        print(f"  [swap_flies] {b} <- {data_csvs[a]}")
+    else:
+        effective_csvs = data_csvs
+        mask_idx_of = {fid: i for i, fid in enumerate(fly_ids)}
+
     fly_data = {}
     for fly_id in fly_ids:
-        pts, confs = load_csv_data(data_csvs[fly_id])
+        pts, confs = load_csv_data(effective_csvs[fly_id])
         if pts is not None:
             fly_data[fly_id] = {'points3D': pts, 'confidences': confs}
             print(f"  {fly_id}: {pts.shape[0]} frames loaded")
@@ -320,9 +340,13 @@ def create_multi_animal_videos3D(
         # Draw SAM3 mask overlays (before skeletons so they appear on top)
         if mask_data is not None:
             H_mask, W_mask, n_cams_mask = mask_meta
-            for i, fly_id in enumerate(fly_ids):
+            if swap_flies and mask_data.format == 'legacy':
+                print("  [swap_flies] WARNING: legacy mask format keys by "
+                      "fly_id string, not fly_idx — masks will NOT swap. "
+                      "Re-run the tracker with the ACF (packed) mask format.")
+            for fly_id in fly_ids:
                 masks_bool = mask_data.get_masks_for(
-                    frame_num, fly_id=fly_id, fly_idx=i)
+                    frame_num, fly_id=fly_id, fly_idx=mask_idx_of[fly_id])
                 if masks_bool is None:
                     continue
                 color = fly_colors.get(fly_id, (128, 128, 128))
