@@ -329,7 +329,7 @@ class Dataset3D(BaseDataset):
         for i in range(self.cfg.KEYPOINTDETECT.NUM_JOINTS):
             if (
                 keypoints3D[i][0] != 0
-                or keypoints3D[i][1] == 0
+                or keypoints3D[i][1] != 0
                 or keypoints3D[i][2] != 0
             ):
                 heatmap3D[i, xx, yy, zz] = 255.0 * np.exp(
