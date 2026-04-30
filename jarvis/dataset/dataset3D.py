@@ -161,7 +161,7 @@ class Dataset3D(BaseDataset):
             if (
                 (self.cfg.HYBRIDNET.ROI_CUBE_SIZE == None)
                 or min_cube_size <= self.cfg.HYBRIDNET.ROI_CUBE_SIZE
-            ) and len(keypoints3D_bb) > 1:
+            ) and len(keypoints3D_bb) >= 1:
                 self.image_ids.append(
                     self.dataset["framesets"][set]["frames"][0]
                 )
@@ -377,8 +377,11 @@ class Dataset3D(BaseDataset):
         """
         # keypoints3D = np.array(self.keypoints3D)
         tracking_areas = []
+        is_one_keypoint = False
         for i, keypoints in enumerate(self.keypoints3D):
             keypoints3D_filtered = []
+            if keypoints.shape[0] == 1:
+                is_one_keypoint = True
             for keypoint in keypoints:
                 if keypoint[0] != 0 or keypoint[1] != 0 or keypoint[2] != 0:
                     keypoints3D_filtered.append(keypoint)
@@ -401,6 +404,11 @@ class Dataset3D(BaseDataset):
         min_cube_size = np.max(
             [x_cube_size_min, y_cube_size_min, z_cube_size_min]
         )
+
+        if is_one_keypoint:
+            # inforce a min cube size so it works for 1 keypoints
+            min_cube_size = max(min_cube_size, 85)
+
         rough_bbox_suggestion = min_cube_size * 1.25
         resolution_suggestion = max(
             1, int(np.round(rough_bbox_suggestion / 85.0))
