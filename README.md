@@ -25,7 +25,15 @@ cd JARVIS-HybridNet
 
 - Make sure [Anaconda](https://www.anaconda.com/products/individual) is installed on your machine.
 
-- Setup the jarvis Anaconda environment and activate it
+- Environment update:
+```
+conda create -n jarvis python=3.10
+conda activate jarvis
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+pip install -e .
+```
+
+- Setup the jarvis Anaconda environment and activate it (OUTDATED)
 ```
 conda create -n jarvis python=3.9  pytorch=1.10.1 torchvision cudatoolkit=11.3 notebook  -c pytorch
 conda activate jarvis
