@@ -84,7 +84,7 @@ def predict3D(params):
 
         if points3D_net != None:
             row = []
-            for point, conf in zip(points3D_net.squeeze(), confidences.squeeze().cpu().numpy()):
+            for point, conf in zip(points3D_net.squeeze(0), confidences.squeeze(0).cpu().numpy()):
                 row = row + point.tolist() + [conf]
             writer.writerow(row)
 

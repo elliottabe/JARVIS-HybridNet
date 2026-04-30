@@ -153,8 +153,8 @@ class JarvisPredictor2D(nn.Module):
                         heatmaps.shape[1], 1)
             points2D = torch.cat((m % outputs[1].shape[2], m
                         // outputs[1].shape[3]),
-                        dim=2).squeeze()*2
-            confidences = heatmaps.gather(2,m).squeeze()
+                        dim=2).squeeze(0)*2
+            confidences = heatmaps.gather(2,m).squeeze(-1).squeeze(0)
             confidences = torch.clamp(confidences, max = 255.)/255.
 
             points2D = points2D+centerHM-self.bbox_hw
