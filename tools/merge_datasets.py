@@ -1,6 +1,19 @@
 """
-Merge merge_fly50_V7 + merge_courtship_multianimal_V1_collapsed into a single
-unified JARVIS project.
+Merge one or more single-fly and (collapsed) multi-fly JARVIS datasets into a
+single unified project.
+
+By default merges merge_fly50_V7 (single) + merge_courtship_multianimal_V1_
+collapsed (multi). Pass --single-roots / --ma-roots to merge any number of
+sources, e.g. add a freshly collapsed batch:
+
+  --single-roots .../merge_fly50_V7 \\
+  --ma-roots .../merge_courtship_multianimal_V1_collapsed \\
+             .../merge_multianimal_collapsed \\
+  --out-root .../red_data_unified_V2
+
+Multi-fly (--ma-roots) sources must already be COLLAPSED (one image_id per
+physical frame carrying 1-2 annotations); use scripts/collapse_multianimal_coco.py
+first. Canonical selection prefers ma-root entries (they carry the dual labels).
 
 Deduplicates by frameset content. A "frameset" is all 7 cameras captured at one
 moment. Within each source, framesets are keyed by (timestamp, frame_number).
@@ -31,6 +44,35 @@ import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
+
+import numpy as np
+
+# Two annotations on the SAME physical image are treated as the same animal
+# (a duplicate label) when their mean per-keypoint pixel offset is below this.
+# Distinct flies in a courtship pair sit ~100-200px apart, so 5px cleanly
+# separates "re-label of the same fly" from "the other fly".
+DEDUP_PX = 5.0
+
+
+def _same_animal(a, b):
+    ka = np.array(a["keypoints"], dtype=float).reshape(-1, 3)[:, :2]
+    kb = np.array(b["keypoints"], dtype=float).reshape(-1, 3)[:, :2]
+    diff = np.abs(ka - kb)
+    if np.all(np.isnan(diff)):
+        return False
+    return np.nanmean(diff) < DEDUP_PX
+
+
+def _union_annotations(entries):
+    """Merge annotations across entries of the SAME physical image, dropping
+    near-duplicate labels of the same animal. Recovers a second fly that was
+    split into a different source/split for the same frame."""
+    merged = []
+    for e in entries:
+        for a in e["annotations"]:
+            if not any(_same_animal(a, m) for m in merged):
+                merged.append(a)
+    return merged
 
 
 def md5_of_file(path: Path, chunk_size: int = 2**20) -> str:
@@ -100,10 +142,12 @@ class UnionFind:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--v7-root", type=Path,
-                    default=Path("/data2/users/eabe/datasets/Johnson_lab/red_data/merge_fly50_V7"))
-    ap.add_argument("--ma-root", type=Path,
-                    default=Path("/data2/users/eabe/datasets/Johnson_lab/red_data/merge_courtship_multianimal_V1_collapsed"))
+    ap.add_argument("--single-roots", type=Path, nargs="*",
+                    default=[Path("/data2/users/eabe/datasets/Johnson_lab/red_data/merge_fly50_V7")],
+                    help="one or more single-fly dataset roots")
+    ap.add_argument("--ma-roots", type=Path, nargs="*",
+                    default=[Path("/data2/users/eabe/datasets/Johnson_lab/red_data/merge_courtship_multianimal_V1_collapsed")],
+                    help="one or more COLLAPSED multi-fly dataset roots")
     ap.add_argument("--out-root", type=Path,
                     default=Path("/data2/users/eabe/datasets/Johnson_lab/red_data/red_data_unified"))
     ap.add_argument("--seed", type=int, default=42)
@@ -115,25 +159,47 @@ def main():
 
     rng = random.Random(args.seed)
 
-    print("[1/7] Loading sources …")
-    v7_fs, v7_json = load_source(args.v7_root, "V7")
-    ma_fs, ma_json = load_source(args.ma_root, "MA")
-    all_fs = {**v7_fs, **ma_fs}
-    n_v7_fs, n_ma_fs = len(v7_fs), len(ma_fs)
-    n_v7_imgs = sum(len(v) for v in v7_fs.values())
-    n_ma_imgs = sum(len(v) for v in ma_fs.values())
-    print(f"  V7: {n_v7_fs} framesets / {n_v7_imgs} images")
-    print(f"  MA: {n_ma_fs} framesets / {n_ma_imgs} images")
+    # Build the source list: unique source name per root, tagged single/MA.
+    sources = []  # (source_name, root, is_ma)
+    for root in args.single_roots:
+        sources.append((f"single:{root.name}", root, False))
+    for root in args.ma_roots:
+        sources.append((f"ma:{root.name}", root, True))
+    if not sources:
+        raise SystemExit("No sources given (need --single-roots and/or --ma-roots).")
 
-    for key in ("keypoint_names", "skeleton"):
-        if v7_json["train"].get(key) != ma_json["train"].get(key):
-            raise SystemExit(f"{key} differ between V7 and MA; abort.")
-    keypoint_names = v7_json["train"]["keypoint_names"]
-    skeleton = v7_json["train"]["skeleton"]
-    categories = v7_json["train"]["categories"]
+    is_ma_by_source = {name: is_ma for name, _, is_ma in sources}
+    src_root_by_source = {name: root for name, root, _ in sources}
+
+    print("[1/7] Loading sources …")
+    all_fs = {}
+    ref_json = None
+    fs_count_by_source = {}
+    total_imgs = 0
+    for name, root, is_ma in sources:
+        fs, jblob = load_source(root, name)
+        # source names are unique, so frameset keys never collide across roots
+        all_fs.update(fs)
+        n_fs = len(fs)
+        n_imgs = sum(len(v) for v in fs.values())
+        fs_count_by_source[name] = n_fs
+        total_imgs += n_imgs
+        print(f"  {name} ({'multi' if is_ma else 'single'}): "
+              f"{n_fs} framesets / {n_imgs} images")
+        if ref_json is None:
+            ref_json = jblob
+        else:
+            for key in ("keypoint_names", "skeleton"):
+                if jblob["train"].get(key) != ref_json["train"].get(key):
+                    raise SystemExit(
+                        f"{key} differ between {sources[0][0]} and {name}; abort.")
+
+    keypoint_names = ref_json["train"]["keypoint_names"]
+    skeleton = ref_json["train"]["skeleton"]
+    categories = ref_json["train"]["categories"]
 
     print("[2/7] Hashing images …")
-    n = n_v7_imgs + n_ma_imgs
+    n = total_imgs
     i = 0
     for fs_key, cams in all_fs.items():
         for cam, entry in cams.items():
@@ -175,7 +241,7 @@ def main():
         cams = all_fs[fs_key]
         n_ann = sum(len(e["annotations"]) for e in cams.values())
         n_cams = len(cams)
-        is_ma = 1 if fs_key[0] == "MA" else 0
+        is_ma = 1 if is_ma_by_source[fs_key[0]] else 0
         # Prefer MA > annotations > cams
         return (is_ma, n_ann, n_cams)
 
@@ -190,12 +256,19 @@ def main():
                 per_cam[cam].append(entry)
 
         def entry_rank(e):
-            return (1 if e["source"] == "MA" else 0, len(e["annotations"]))
+            return (1 if is_ma_by_source[e["source"]] else 0, len(e["annotations"]))
 
         chosen = {}
         for cam, entries in per_cam.items():
             entries.sort(key=entry_rank, reverse=True)
-            chosen[cam] = entries[0]
+            canon = dict(entries[0])
+            # Union labels from every entry that is the SAME physical image
+            # (identical md5) as the canonical pick, so a fly that was labeled
+            # in a different split/source for this frame is not dropped. Entries
+            # whose image differs (different md5) are left out of the union.
+            same_image = [e for e in entries if e["md5"] == canon["md5"]]
+            canon["annotations"] = _union_annotations(same_image)
+            chosen[cam] = canon
 
         unified_framesets.append({
             "canonical_source": canon_key[0],
@@ -293,8 +366,8 @@ def main():
                 print(f"  copied {copied}/{total_to_copy}")
     print(f"  copied {copied}/{total_to_copy}")
 
-    # Calibrations: MA timestamps come from MA source, V7 timestamps from V7 source.
-    src_root_by_source = {"V7": args.v7_root, "MA": args.ma_root}
+    # Calibrations: each timestamp's calib comes from its canonical source root.
+    # (src_root_by_source was built from the source list during loading.)
     ts_source = {}
     for u in complete:
         ts_source[u["canonical_timestamp"]] = u["canonical_source"]
@@ -379,12 +452,11 @@ def main():
         print(f"  {out_path}  ({len(images_out)} imgs, {len(annotations_out)} anns)")
 
     report = {
-        "v7_root": str(args.v7_root),
-        "ma_root": str(args.ma_root),
+        "single_roots": [str(r) for r in args.single_roots],
+        "ma_roots": [str(r) for r in args.ma_roots],
         "out_root": str(args.out_root),
         "seed": args.seed,
-        "source_v7_framesets": n_v7_fs,
-        "source_ma_framesets": n_ma_fs,
+        "source_framesets": fs_count_by_source,
         "unified_framesets_total": len(unified_framesets),
         "unified_framesets_complete": len(complete),
         "unified_framesets_incomplete": len(incomplete),
