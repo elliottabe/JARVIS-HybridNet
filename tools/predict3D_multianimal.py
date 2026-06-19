@@ -397,38 +397,56 @@ def save_bout_masks(bout_masks, bout_out_dir, num_animals):
 
 
 def render_overlay(frames_rgb, fly_slots, per_fly_kp_2d, abs_frame, out_path,
-                   num_animals, repro_tool=None):
-    """Render a 1×num_cams PNG grid: RGB + per-fly mask tint + KP dots."""
+                   num_animals, repro_tool=None, edges=None, pad=45):
+    """Render a 1×num_cams PNG grid, zoomed to the flies, with the reprojected
+    skeleton (lines + dots) per fly and the SAM3 mask tint. Off-image keypoints
+    are filtered so a stray reprojection can't blow up the view."""
     num_cams = frames_rgb.shape[0]
-    fig, axes = plt.subplots(1, num_cams, figsize=(2.2 * num_cams, 2.4))
+    fig, axes = plt.subplots(1, num_cams, figsize=(2.7 * num_cams, 2.7))
     if num_cams == 1:
         axes = [axes]
     fly_colors = [(1.0, 0.2, 0.2), (0.2, 0.5, 1.0)]
 
     for cam in range(num_cams):
         ax = axes[cam]
+        H, W = frames_rgb[cam].shape[:2]
         ax.imshow(frames_rgb[cam])
         ax.set_axis_off()
         ax.set_title(f'cam{cam}', fontsize=8)
 
+        all_x, all_y = [], []
         for fly_idx in range(num_animals):
+            col = fly_colors[fly_idx]
             slot = fly_slots[fly_idx] if fly_slots is not None else None
             if slot is not None and slot['valid'][cam].item():
                 mk = slot['masks'][cam].numpy()
                 overlay = np.zeros((*mk.shape, 4), dtype=np.float32)
-                overlay[..., :3] = fly_colors[fly_idx]
-                overlay[..., 3] = mk * 0.32
+                overlay[..., :3] = col
+                overlay[..., 3] = mk * 0.22
                 ax.imshow(overlay)
 
             pts = per_fly_kp_2d[fly_idx] if per_fly_kp_2d else None
-            if pts is not None and pts[cam] is not None:
-                xs, ys = pts[cam][:, 0], pts[cam][:, 1]
-                ax.scatter(xs, ys, s=3, c=[fly_colors[fly_idx]],
-                           edgecolors='white', linewidths=0.2)
+            if pts is None or pts[cam] is None:
+                continue
+            P = np.asarray(pts[cam])
+            inb = (P[:, 0] >= 0) & (P[:, 0] < W) & (P[:, 1] >= 0) & (P[:, 1] < H)
+            if edges:
+                for a, b in edges:
+                    if a < len(P) and b < len(P) and inb[a] and inb[b]:
+                        ax.plot([P[a, 0], P[b, 0]], [P[a, 1], P[b, 1]],
+                                '-', color=col, lw=0.6, alpha=0.9)
+            ax.scatter(P[inb, 0], P[inb, 1], s=5, c=[col],
+                       edgecolors='white', linewidths=0.25, zorder=3)
+            all_x += list(P[inb, 0]); all_y += list(P[inb, 1])
+
+        if all_x:  # zoom this camera to the flies
+            x0 = max(0, min(all_x) - pad); x1 = min(W, max(all_x) + pad)
+            y0 = max(0, min(all_y) - pad); y1 = min(H, max(all_y) + pad)
+            ax.set_xlim(x0, x1); ax.set_ylim(y1, y0)  # y inverted for image coords
 
     fig.suptitle(f'frame {abs_frame}', fontsize=9)
     plt.tight_layout(rect=(0, 0, 1, 0.94))
-    fig.savefig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=140)
     plt.close(fig)
 
 
@@ -439,6 +457,10 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
     num_cams = len(video_paths)
     bbox_hw = cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE // 2
     cd_input_size = int(cfg.CENTERDETECT.IMAGE_SIZE)
+    # Skeleton edges (keypoint-index pairs) for legible overlay rendering.
+    _kp2idx = {n: i for i, n in enumerate(cfg.KEYPOINT_NAMES)}
+    skel_edges = [(_kp2idx[a], _kp2idx[b]) for a, b in cfg.SKELETON
+                  if a in _kp2idx and b in _kp2idx]
     # Anchor every CUDA op in this function to the reproTool's device — with
     # SAM3 living on a separate GPU, the process-wide default may point
     # elsewhere and `.cuda()` silently goes to the wrong card.
@@ -559,14 +581,16 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
                 pts3d_np, _ = per_fly_results[fly_idx]
                 pts3d = torch.from_numpy(pts3d_np).float().to(
                     cameraMatrices.device)
-                pts2d = repro_tool.reprojectPoint(pts3d)   # (num_cams, K, 2)
-                pts2d_np = pts2d.detach().cpu().numpy()
+                pts2d = repro_tool.reprojectPoint(pts3d)   # (K, num_cams, 2)
+                pts2d_np = pts2d.detach().float().cpu().numpy()
+                # pts2d_np[:, c, :] = camera c's reprojection of ALL keypoints
+                # (K, 2). Indexing [c] would wrongly grab keypoint c across cams.
                 per_fly_kp_2d.append(
-                    [pts2d_np[c] for c in range(num_cams)])
+                    [pts2d_np[:, c, :] for c in range(num_cams)])
             render_overlay(
                 frames_rgb, fly_slots, per_fly_kp_2d, abs_frame,
                 os.path.join(overlay_dir, f'frame_{abs_frame:06d}.png'),
-                num_animals, repro_tool=repro_tool)
+                num_animals, repro_tool=repro_tool, edges=skel_edges)
 
         if f_local % log_every == 0:
             print(f'    bout {bout["bout_idx"]} '
@@ -640,13 +664,17 @@ def main():
     pm = ProjectManager()
     assert pm.load(args.project), f'could not load project {args.project}'
     cfg = pm.get_cfg()
-    repro_tool = get_repro_tool(cfg, None)
+    session_dir = os.path.abspath(args.session)
+    # Use the RECORDING's own calibration (session/calibration/), not the
+    # training dataset's calibration, so the 3D reconstruction matches this
+    # recording's actual camera geometry.
+    session_calib = os.path.join(session_dir, 'calibration')
+    repro_tool = get_repro_tool(
+        cfg, session_calib if os.path.isdir(session_calib) else None)
     assert repro_tool is not None, 'ReprojectionTool not available'
 
     centerDetect, kp_model, hybridNet = build_models(
         cfg, args.center_weights, args.kp_weights, args.hybridnet_weights)
-
-    session_dir = os.path.abspath(args.session)
     session_tag = '/'.join(session_dir.rstrip('/').split('/')[-2:])
 
     csv_path = args.bouts_csv

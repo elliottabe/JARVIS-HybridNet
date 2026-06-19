@@ -23,6 +23,18 @@ def load_weights_keypoint_detect(model, weights_path = None):
     if weights_path is not None:
         if os.path.isfile(weights_path):
             pretrained_dict = torch.load(weights_path)
+            # A masked KeypointDetect model has a 4-channel conv stem (RGB +
+            # instance-mask channel). HybridNet's internal effTrack is 3-channel
+            # (the mask channel is bypassed at inference; see
+            # tools/predict3D_multianimal.py), so drop the 4th input channel
+            # from any mismatched conv weight and load just the RGB backbone.
+            model_dict = model.state_dict()
+            for k, v in list(pretrained_dict.items()):
+                if (k in model_dict and hasattr(v, 'dim') and v.dim() == 4
+                        and v.shape[1] == 4 and model_dict[k].shape[1] == 3):
+                    pretrained_dict[k] = v[:, :3].contiguous()
+                    clp.info(f'Dropped instance-mask channel from {k} '
+                             f'(4->3 ch) for HybridNet effTrack.')
             model.load_state_dict(pretrained_dict, strict=False)
             clp.info(f'Successfully loaded weights: {weights_path}')
             return True
