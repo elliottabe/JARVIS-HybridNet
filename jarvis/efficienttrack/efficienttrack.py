@@ -19,7 +19,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from .model import EfficientTrackBackbone
-from .loss import HeatmapLoss
+from .loss import HeatmapLoss, mask_containment_loss
 import jarvis.efficienttrack.utils as utils
 from jarvis.utils.logger import NetLogger, AverageMeter
 import jarvis.utils.clp as clp
@@ -75,6 +75,19 @@ class EfficientTrack:
 
             self.criterion = HeatmapLoss(self.cfg, self.mode)
             self.model = self.model.cuda()
+
+            # Mask-containment soft loss (KeypointDetect 4-ch only). Penalizes
+            # predicted heatmap mass off the fly body. Off unless
+            # KEYPOINTDETECT.MASK_CONTAINMENT_WEIGHT > 0 in the project config.
+            self.mask_contain_weight = (
+                float(getattr(self.cfg, 'MASK_CONTAINMENT_WEIGHT', 0.0))
+                if self.mode == 'KeypointDetect' else 0.0)
+            self.mask_contain_dilate = int(
+                getattr(self.cfg, 'MASK_CONTAINMENT_DILATE', 11))
+            if self.mask_contain_weight > 0:
+                print(f"[KeypointDetect] mask-containment loss ON "
+                      f"(weight={self.mask_contain_weight}, "
+                      f"dilate={self.mask_contain_dilate})")
 
             if self.cfg.OPTIMIZER == 'adamw':
                 self.optimizer = torch.optim.AdamW(self.model.parameters(),
@@ -304,6 +317,11 @@ class EfficientTrack:
                     if heatmaps_losses[idx] is not None:
                         heatmaps_loss = heatmaps_losses[idx].mean(dim=0)
                         loss = loss + heatmaps_loss
+                if self.mask_contain_weight > 0 and imgs.shape[1] >= 4:
+                    mc = mask_containment_loss(
+                        outputs, heatmaps, imgs[:, 3:4],
+                        dilate=self.mask_contain_dilate)
+                    loss = loss + self.mask_contain_weight * mc
                 loss.backward()
                 self.optimizer.step()
                 if self.cfg.USE_ONECYLCLE:
@@ -367,6 +385,11 @@ class EfficientTrack:
                             if heatmaps_losses[idx] is not None:
                                 heatmaps_loss = heatmaps_losses[idx].mean(dim=0)
                                 loss = loss + heatmaps_loss
+                        if self.mask_contain_weight > 0 and imgs.shape[1] >= 4:
+                            mc = mask_containment_loss(
+                                outputs, heatmaps, imgs[:, 3:4],
+                                dilate=self.mask_contain_dilate)
+                            loss = loss + self.mask_contain_weight * mc
 
                     outs = outputs[1].clamp(0,255).detach()
                     acc = self.calculate_accuracy(outs, keypoints)
