@@ -74,6 +74,11 @@ _C.KEYPOINTDETECT.VAL_INTERVAL = 1
 # tools/sam3_label_masks.py.
 _C.KEYPOINTDETECT.INSTANCE_MASK_INPUT = False
 _C.KEYPOINTDETECT.SAM3_MASKS_DIRNAME = 'sam3_masks'
+# Mask-containment soft loss (4-ch KeypointDetect only): penalizes predicted-
+# heatmap mass landing off the fly body (outside the dilated mask channel),
+# protected by the GT heatmap. 0 disables.
+_C.KEYPOINTDETECT.MASK_CONTAINMENT_WEIGHT = 0.0
+_C.KEYPOINTDETECT.MASK_CONTAINMENT_DILATE = 11
 
 _C.AUGMENTATION = CN()
 _C.AUGMENTATION.COLOR_MANIPULATION = CN()
@@ -110,6 +115,8 @@ _C.HYBRIDNET.GRID_SPACING = None
 _C.HYBRIDNET.USE_ONECYLCLE = True
 _C.HYBRIDNET.BATCH_SIZE = 1
 _C.HYBRIDNET.OPTIMIZER = 'adamw'
+# Graph-Laplacian (bone-vector) shape-prior loss weight on 3D keypoints. 0 off.
+_C.HYBRIDNET.LAPLACIAN_WEIGHT = 0.0
 
 _C.HYBRIDNET.MAX_LEARNING_RATE = 0.003
 _C.HYBRIDNET.NUM_EPOCHS = 30
