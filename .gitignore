@@ -13,8 +13,13 @@ __pycache__/
 *.onnx
 *.npy
 *.csv
+*.out
+*.log
+*.pth
 projects/
 OutFiles/
+pretrained/
+tools/logs/
 
 *.code-workspace
 /reports/
