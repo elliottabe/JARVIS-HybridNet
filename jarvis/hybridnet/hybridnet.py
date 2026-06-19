@@ -18,7 +18,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from .model import HybridNetBackbone
-from .loss import MSELoss
+from .loss import MSELoss, build_skeleton_edges, graph_laplacian_loss
 import jarvis.utils.utils as utils
 from jarvis.utils.logger import NetLogger, AverageMeter
 import jarvis.utils.clp as clp
@@ -63,6 +63,18 @@ class HybridNet:
 
             self.criterion = MSELoss()
             self.model = self.model.cuda()
+
+            # Graph-Laplacian (bone-vector) shape prior. Off unless
+            # HYBRIDNET.LAPLACIAN_WEIGHT > 0 in the project config.
+            self.lap_weight = float(getattr(self.cfg.HYBRIDNET,
+                                            'LAPLACIAN_WEIGHT', 0.0))
+            _edges = build_skeleton_edges(self.cfg.KEYPOINT_NAMES,
+                                          self.cfg.SKELETON)
+            self.lap_ei = _edges[:, 0].cuda() if _edges.numel() else _edges
+            self.lap_ej = _edges[:, 1].cuda() if _edges.numel() else _edges
+            if self.lap_weight > 0:
+                print(f"[HybridNet] graph-Laplacian shape prior ON "
+                      f"(weight={self.lap_weight}, {len(self.lap_ei)} bones)")
 
             if self.cfg.HYBRIDNET.OPTIMIZER == 'adamw':
                 self.optimizer = torch.optim.AdamW(self.model.parameters(),
@@ -216,6 +228,12 @@ class HybridNet:
                 loss = self.criterion(outputs[0], heatmap3D)
                 loss = loss.mean()
 
+                if self.lap_weight > 0:
+                    valid = (keypoints.abs().sum(dim=2) > 0)
+                    lap = graph_laplacian_loss(outputs[2], keypoints, valid,
+                                               self.lap_ei, self.lap_ej)
+                    loss = loss + self.lap_weight * lap
+
                 acc = 0
                 count = 0
                 for i,keypoints_batch in enumerate(keypoints):
@@ -297,6 +315,12 @@ class HybridNet:
                                              cameraMatrices)
                         loss = self.criterion(outputs[0], heatmap3D)
                         loss = loss.mean()
+                        if self.lap_weight > 0:
+                            valid = (keypoints.abs().sum(dim=2) > 0)
+                            lap = graph_laplacian_loss(
+                                outputs[2], keypoints, valid,
+                                self.lap_ei, self.lap_ej)
+                            loss = loss + self.lap_weight * lap
                         acc = 0
                         count = 0
                         for i,keypoints_batch in enumerate(keypoints):
