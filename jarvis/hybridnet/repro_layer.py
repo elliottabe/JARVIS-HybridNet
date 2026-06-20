@@ -96,9 +96,17 @@ class ReprojectionLayer(nn.Module):
 
 
     def forward(self, heatmaps, center, centerHM, cameraMatrices):
-        # for batch in range(heatmaps.shape[0]):
-        grid = self.grid+center[0]
-        heatmaps3D = self._get_heatmap_value(torch.transpose(
-                    heatmaps[0], 0,1), grid, cameraMatrices[0], centerHM[0]).unsqueeze(0)
+        # Process each frameset in the batch with its own 3D-reprojection
+        # geometry (grid offset, camera matrices, crop centers) and stack.
+        # Previously this only handled batch index 0 (collapsing the batch to
+        # 1); the per-sample helpers (_get_heatmap_value / reprojectPoints) are
+        # unchanged, so this is identical to the old path for batch size 1.
+        outs = []
+        for b in range(heatmaps.shape[0]):
+            grid = self.grid + center[b]
+            outs.append(self._get_heatmap_value(
+                torch.transpose(heatmaps[b], 0, 1), grid,
+                cameraMatrices[b], centerHM[b]))
+        heatmaps3D = torch.stack(outs, dim=0)
 
         return heatmaps3D
