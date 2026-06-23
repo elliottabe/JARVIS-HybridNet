@@ -233,6 +233,47 @@ def run_kp_and_3d(kp_model, hybridNet, imgs_4ch, center3D, centerHMs,
     return points3D.squeeze(0), confidences.squeeze(0)
 
 
+def triangulate_kp(kp_model, repro_tool, imgs_4ch, centerHMs, cfg,
+                   min_cam_conf=0.25):
+    """DLT-triangulation fallback for the HybridNet 3D fusion.
+
+    Extracts 2D keypoints from the KeypointDetect heatmaps (soft-argmax) and
+    triangulates each directly across cameras via repro_tool.reconstructPoint,
+    gating/weighting by per-camera peak confidence. Use when the learned v2vNet
+    collapses on the courtship inference domain (see tools/diag_*.py: the 2D
+    detections + calibration are correct — DLT gives ~4px reprojection — but the
+    v2vNet outputs a diffuse 3D heatmap). Returns (points3D (K,3), conf (K,))."""
+    bbox_hw = cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE // 2
+    crop = bbox_hw * 2
+    dev = imgs_4ch.device
+    with torch.no_grad():
+        hm = kp_model(imgs_4ch)[1]                       # (C, K, h, w)
+    C, K, h, w = hm.shape
+    flat = hm.clamp(min=0.).view(C, K, h * w)
+    norm = flat.sum(dim=2).clamp(min=1e-6)               # (C, K)
+    gx = torch.arange(w, device=dev).repeat(h).float()            # (h*w,)
+    gy = torch.arange(h, device=dev).repeat_interleave(w).float()
+    sx = (flat * gx.view(1, 1, -1)).sum(2) / norm        # (C, K) heatmap px
+    sy = (flat * gy.view(1, 1, -1)).sum(2) / norm
+    peak = (flat.max(dim=2)[0] / 255.).clamp(0., 1.)     # (C, K) per-cam conf
+    # heatmap px -> full-image px (crop of side `crop` placed at centerHMs)
+    fx = sx * (crop / w) + (centerHMs[:, 0:1].float() - bbox_hw)   # (C, K)
+    fy = sy * (crop / h) + (centerHMs[:, 1:2].float() - bbox_hw)
+    pts, confs = [], []
+    for k in range(K):
+        wt = peak[:, k].clone()
+        gated = wt.clone()
+        gated[gated < min_cam_conf] = 0.
+        if int((gated > 0).sum()) >= 2:                  # keep confident views
+            wt = gated
+        p = torch.stack([fx[:, k], fy[:, k]], dim=0)     # (2, C)
+        X = repro_tool.reconstructPoint(p.clone(), wt.view(C, 1, 1))
+        pts.append(X)
+        m = (wt > 0)
+        confs.append(peak[m, k].mean() if bool(m.any()) else peak[:, k].mean())
+    return torch.stack(pts), torch.stack(confs)
+
+
 def csv_writer_for_fly(out_dir, fly_idx, cfg):
     """Create one CSV per fly with the standard JARVIS 3D header."""
     path = os.path.join(out_dir, f'fly{fly_idx}.csv')
@@ -452,7 +493,7 @@ def render_overlay(frames_rgb, fly_slots, per_fly_kp_2d, abs_frame, out_path,
 
 def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
                  hybridNet, repro_tool, cfg, bout_out_dir, num_animals=2,
-                 log_every=50, save_overlays_every=0):
+                 log_every=50, save_overlays_every=0, triangulate=False):
     """Iterate every frame of a bout, writing one CSV per fly."""
     num_cams = len(video_paths)
     bbox_hw = cfg.KEYPOINTDETECT.BOUNDING_BOX_SIZE // 2
@@ -555,9 +596,13 @@ def predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
                 frames_rgb, centerHMs, target_masks, distractor_masks,
                 bbox_hw, mean_rgb, std_rgb, device=dev)
 
-            points3D, confs = run_kp_and_3d(
-                kp_model, hybridNet, imgs_4ch,
-                center3D, centerHMs, cameraMatrices)
+            if triangulate:
+                points3D, confs = triangulate_kp(
+                    kp_model, repro_tool, imgs_4ch, centerHMs, cfg)
+            else:
+                points3D, confs = run_kp_and_3d(
+                    kp_model, hybridNet, imgs_4ch,
+                    center3D, centerHMs, cameraMatrices)
 
             per_fly_results[fly_idx] = (
                 points3D.cpu().numpy(), confs.cpu().numpy())
@@ -654,6 +699,11 @@ def main():
                     help='If >0, write a 1×num_cams PNG overlay '
                          '(RGB + mask tint + KP dots) every N frames per '
                          'bout under <bout>/overlays/. 0 disables.')
+    ap.add_argument('--triangulate', action='store_true',
+                    help='Bypass HybridNet 3D fusion and triangulate the 2D '
+                         'KeypointDetect keypoints directly via DLT. Workaround '
+                         'for the v2vNet collapse on courtship inference (the 2D '
+                         '+ calibration are correct; see tools/diag_*.py).')
     ap.add_argument('--save-clips', action='store_true',
                     help='After each bout, render one annotated MP4 per '
                          'camera under <bout>/clips/ via '
@@ -735,7 +785,8 @@ def main():
         predict_bout(bout, bout_masks, video_paths, centerDetect, kp_model,
                      hybridNet, repro_tool, cfg, bout_out,
                      num_animals=args.num_animals,
-                     save_overlays_every=args.save_overlays_every)
+                     save_overlays_every=args.save_overlays_every,
+                     triangulate=args.triangulate)
         print(f'  3D predict in {time.time() - t0:.1f}s')
 
         if args.save_clips:

@@ -10,7 +10,8 @@ import os
 from pathlib import Path
 import shutil
 import collections
-import streamlit.cli
+# NOTE: `import streamlit.cli` is done lazily inside launch() — it was removed
+# in newer streamlit (>=1.12) and is only needed for the GUI, not train/predict.
 
 from jarvis.config.project_manager import ProjectManager
 import jarvis.ui.cli.cli as main_cli
@@ -47,6 +48,7 @@ def launch():
     """
     Launch the Streamlit GUI in your browser.
     """
+    import streamlit.cli  # lazy: only needed for the GUI (removed in streamlit>=1.12)
     project = ProjectManager()
     home = str(Path.home())
     os.makedirs(os.path.join(home, '.streamlit'), exist_ok = True)

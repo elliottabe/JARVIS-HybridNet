@@ -14,6 +14,7 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+import jarvis.utils.numpy2_compat  # noqa: F401  (restore np aliases for imgaug on numpy>=2)
 import imgaug.augmenters as iaa
 
 current_dir = os.path.dirname(os.path.abspath(inspect.getfile(

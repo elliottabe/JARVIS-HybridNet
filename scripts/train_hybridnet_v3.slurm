@@ -25,6 +25,9 @@ set -x
 source ~/.bashrc
 micromamba activate 3d_tracking
 unset LD_LIBRARY_PATH
+# 3d_tracking (py3.12) packages need a newer libstdc++ than system /lib64;
+# preload the env's own (matches scripts/train_arm_local.sh).
+export LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6"
 echo "$SLURMD_NODENAME"
 nvidia-smi
 cd /gscratch/portia/eabe/Research/MyRepos/3d_tracking_dataset/third_party/JARVIS-HybridNet

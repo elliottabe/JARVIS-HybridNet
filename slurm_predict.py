@@ -88,6 +88,7 @@ def submit_predict(
     dataset=None,
     predict_script_name='jarvis_batch_multi_animal.py',
     save_clips=False,
+    triangulate=False,
 ):
     """Construct and submit a SLURM prediction job.
 
@@ -119,6 +120,7 @@ def submit_predict(
 
     bouts_line = f" \\\n    --bouts_csv {bouts_csv}" if bouts_csv else ""
     save_clips_line = " \\\n    --save-clips" if save_clips else ""
+    triangulate_line = " \\\n    --triangulate" if triangulate else ""
 
     # In bouts mode, stage the new JARVIS output into a sibling
     # <bouts_root>_bouts/Predictions_3D_<job_id>/ directory so the downstream
@@ -181,7 +183,7 @@ python -u {predict_script} \\
     --calib_folder {calib_folder} \\
     --num_animals 2 \\
     --num_gpus {num_gpus} \\
-    --output_name $SLURM_JOB_ID{bouts_line}{save_clips_line}
+    --output_name $SLURM_JOB_ID{bouts_line}{save_clips_line}{triangulate_line}
 {stage_block}"""
     print(f"Submitting: {recording_name}")
     job_id = slurm_submit(script)
@@ -317,6 +319,13 @@ Examples:
              "Only meaningful with --predict_script tools/predict3D_multianimal_shard.py.",
     )
     parser.add_argument(
+        "--triangulate",
+        action="store_true",
+        help="Pass --triangulate through: bypass HybridNet 3D fusion and "
+             "DLT-triangulate the 2D keypoints (workaround for the v2vNet "
+             "courtship collapse). Shard pipeline only.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Print jobs that would be submitted without actually submitting",
@@ -434,6 +443,7 @@ Examples:
             time_limit=args.time,
             predict_script_name=args.predict_script,
             save_clips=args.save_clips,
+            triangulate=args.triangulate,
         )
         submitted_jobs.append((os.path.basename(recording_folder), job_id))
 

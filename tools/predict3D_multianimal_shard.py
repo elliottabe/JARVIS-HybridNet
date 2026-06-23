@@ -76,6 +76,9 @@ def main():
     ap.add_argument('--reuse-masks', action='store_true')
     ap.add_argument('--save-overlays-every', type=int, default=0)
     ap.add_argument('--save-clips', action='store_true')
+    ap.add_argument('--triangulate', action='store_true',
+                    help='Bypass HybridNet 3D fusion; DLT-triangulate the 2D '
+                         'keypoints (workaround for the v2vNet courtship collapse).')
     args = ap.parse_args()
 
     if args.num_gpus % 2 != 0 or args.num_gpus < 2:
@@ -187,6 +190,8 @@ def main():
             cmd += ['--save-overlays-every', str(args.save_overlays_every)]
         if args.save_clips:
             cmd += ['--save-clips']
+        if args.triangulate:
+            cmd += ['--triangulate']
 
         log_path = os.path.join(out_dir, f'shard_{i}.log')
         log_f = open(log_path, 'w')
