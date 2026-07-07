@@ -202,6 +202,21 @@ class BoutMasks:
         the enumeration makes the final ordering independent of this
         tiebreak.
         """
+        # Single fly (free-running): no cross-camera identity ambiguity -- every
+        # SAM3 obj_id in a camera is the one fly (slot 0). The anchor-ranking +
+        # 2^(C-1) enumeration below is only meaningful for >=2 animals, so short
+        # -circuit here (it otherwise raises NotImplementedError for num_animals!=2).
+        if num_animals == 1:
+            for cam in range(self.num_cameras):
+                oids = set()
+                for fd in self.masks[cam]:            # per-frame {obj_id: {...}}
+                    oids.update(int(o) for o in fd.keys())
+                self.identity_map[cam] = {o: 0 for o in oids}
+            n = sum(len(m) for m in self.identity_map if m)
+            print(f"  [assign_identities] single-fly: mapped {n} obj_id(s) -> slot 0 "
+                  f"across {self.num_cameras} cameras")
+            return
+
         dev = repro_tool.cameraMatrices.device
 
         # --- Step 1: rank anchor candidates -------------------------
