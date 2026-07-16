@@ -592,24 +592,42 @@ class SAM3VideoTracker:
         print(f"  SAM3 video predictor loaded.")
 
     def _extract_bout_frames(self, video_path, frame_start, num_frames,
-                             output_dir):
-        """Extract bout frames from video to JPEG folder for SAM3."""
+                             output_dir, positions=None):
+        """Extract bout frames from video to a contiguous JPEG folder for SAM3.
+
+        positions: optional list of length num_frames; positions[i] is the mp4 frame
+        that fills output index i (canonical slot), or None for a dropped slot (written
+        as a black placeholder so the folder stays a contiguous {i:06d}.jpg sequence and
+        every camera's folder is canonical-slot-aligned). positions=None -> the old
+        positional read (frame_start .. frame_start+num_frames), byte-identical."""
         os.makedirs(output_dir, exist_ok=True)
+        if positions is None:
+            positions = [frame_start + i for i in range(num_frames)]
         cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
+        cursor = None
+        black = None
         for i in range(num_frames):
+            pos = positions[i]
+            if pos is None:
+                if black is None:
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    black = np.zeros((h, w, 3), "uint8")
+                cv2.imwrite(os.path.join(output_dir, f'{i:06d}.jpg'), black,
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                continue
+            if pos != cursor:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos); cursor = pos
             ret, frame = cap.read()
+            cursor += 1
             if not ret:
                 break
-            cv2.imwrite(
-                os.path.join(output_dir, f'{i:06d}.jpg'),
-                frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 95],
-            )
+            cv2.imwrite(os.path.join(output_dir, f'{i:06d}.jpg'), frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, 95])
         cap.release()
 
     def process_bout(self, video_paths, frame_start, num_frames,
-                     num_animals=2):
+                     num_animals=2, positions_per_cam=None):
         """
         Run SAM3 video propagation on all cameras for one bout.
 
@@ -618,6 +636,11 @@ class SAM3VideoTracker:
             frame_start: first frame number in the original video
             num_frames: number of frames in the bout
             num_animals: expected number of animals
+            positions_per_cam: optional list (camera order == video_paths order) of
+                per-camera position lists (see `_extract_bout_frames`), one entry per
+                camera, each of length num_frames with int mp4-positions or None for a
+                dropped/desynced slot. None (default) keeps the old positional
+                extraction (frame_start .. frame_start+num_frames) for every camera.
 
         Returns:
             BoutMasks object with per-camera, per-frame, per-fly masks
@@ -635,7 +658,7 @@ class SAM3VideoTracker:
             with torch.cuda.device(self.gpu_id):
                 self._process_bout_inner(
                     video_paths, frame_start, num_frames, num_animals,
-                    bout_masks, tmp_base)
+                    bout_masks, tmp_base, positions_per_cam=positions_per_cam)
         finally:
             shutil.rmtree(tmp_base, ignore_errors=True)
 
@@ -682,7 +705,8 @@ class SAM3VideoTracker:
                                         np.asarray(keep_probs))
 
     def _process_bout_inner(self, video_paths, frame_start, num_frames,
-                            num_animals, bout_masks, tmp_base):
+                            num_animals, bout_masks, tmp_base,
+                            positions_per_cam=None):
         # Thread-local CUDA current device — belt-and-suspenders alongside
         # the torch.cuda.device(self.gpu_id) context wrapping this call,
         # so any sam3 internals that resolve torch.device("cuda") pick up
@@ -691,19 +715,24 @@ class SAM3VideoTracker:
         chunked = self.chunk_len and num_frames > self.chunk_len
         for cam_idx, video_path in enumerate(video_paths):
             cam_name = os.path.splitext(os.path.basename(video_path))[0]
+            cam_positions = (None if positions_per_cam is None
+                             else positions_per_cam[cam_idx])
             if chunked:
                 self._track_camera_chunked(cam_idx, video_path, cam_name,
-                                           frame_start, num_frames, bout_masks, tmp_base)
+                                           frame_start, num_frames, bout_masks, tmp_base,
+                                           positions=cam_positions)
             else:
                 self._track_camera_single(cam_idx, video_path, cam_name,
-                                          frame_start, num_frames, bout_masks, tmp_base)
+                                          frame_start, num_frames, bout_masks, tmp_base,
+                                          positions=cam_positions)
 
     def _track_camera_single(self, cam_idx, video_path, cam_name, frame_start,
-                             num_frames, bout_masks, tmp_base):
+                             num_frames, bout_masks, tmp_base, positions=None):
         """Original single-pass per-camera tracking (whole bout in one session)."""
         cam_dir = os.path.join(tmp_base, cam_name)
         print(f"    Extracting frames for {cam_name}...")
-        self._extract_bout_frames(video_path, frame_start, num_frames, cam_dir)
+        self._extract_bout_frames(video_path, frame_start, num_frames, cam_dir,
+                                  positions=positions)
 
         start_req = {'type': 'start_session', 'resource_path': cam_dir}
         if self.sam3_version == 'sam3.1':
@@ -730,7 +759,7 @@ class SAM3VideoTracker:
         print(f"    {cam_name}: done")
 
     def _track_camera_chunked(self, cam_idx, video_path, cam_name, frame_start,
-                              num_frames, bout_masks, tmp_base):
+                              num_frames, bout_masks, tmp_base, positions=None):
         """Chunked per-camera tracking for long bouts (bounds GPU memory).
 
         Chunk 0 is text-prompted (detection); each later chunk is box-prompted
@@ -738,7 +767,11 @@ class SAM3VideoTracker:
         then its SAM3 obj_ids are matched back to the canonical ids by mask IoU
         at the boundary. All frames are stored at GLOBAL bout indices with
         canonical ids, so the resulting BoutMasks is identical in shape/semantics
-        to the single-pass path (assign_identities et al. are unchanged)."""
+        to the single-pass path (assign_identities et al. are unchanged).
+
+        positions (optional): full-bout position list (length num_frames, see
+        `_extract_bout_frames`); sliced per chunk [gs:ge] so each chunk's frames
+        stay canonical-slot-aligned the same way the single-pass path is."""
         L, O = self.chunk_len, self.chunk_overlap
         step = max(1, L - O)
         starts = list(range(0, num_frames, step))
@@ -749,7 +782,9 @@ class SAM3VideoTracker:
             if ci > 0 and gs >= num_frames:
                 break
             cdir = os.path.join(tmp_base, f"{cam_name}_c{ci}")
-            self._extract_bout_frames(video_path, frame_start + gs, ge - gs, cdir)
+            chunk_positions = None if positions is None else positions[gs:ge]
+            self._extract_bout_frames(video_path, frame_start + gs, ge - gs, cdir,
+                                      positions=chunk_positions)
             start_req = {'type': 'start_session', 'resource_path': cdir}
             if self.sam3_version == 'sam3.1':
                 start_req['offload_video_to_cpu'] = True
