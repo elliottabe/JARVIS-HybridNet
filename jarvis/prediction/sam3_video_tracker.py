@@ -549,10 +549,19 @@ class SAM3VideoTracker:
                  apply_temporal_disambiguation=False,
                  sam3_version='sam3.1', compile=True,
                  max_num_objects=16, checkpoint_path=None,
-                 use_fa3=False):
+                 use_fa3=False, chunk_len=1400, chunk_overlap=120):
         self.gpu_id = gpu_id
         self.text_prompt = text_prompt
         self.sam3_version = sam3_version
+        # Long-bout chunking: SAM 3.1 multiplex keeps per-frame memory features
+        # on-GPU during propagation, so ~2000+ frame bouts OOM a 44 GB card even
+        # with offload_video_to_cpu. When a bout exceeds `chunk_len` frames it is
+        # tracked in overlapping chunks (each start_session/propagate/close frees
+        # GPU memory); identity is carried across a chunk boundary by box-prompting
+        # the next chunk at the previous chunk's object bboxes + an overlap IoU
+        # match. chunk_len=0 disables chunking (always single-pass).
+        self.chunk_len = int(chunk_len)
+        self.chunk_overlap = int(chunk_overlap)
 
         print(f"  Loading SAM3 video predictor ({sam3_version}) "
               f"on cuda:{gpu_id}...")
@@ -632,6 +641,46 @@ class SAM3VideoTracker:
 
         return bout_masks
 
+    # ── chunk helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _mask_bbox_norm(mask):
+        """(H,W) bool mask -> normalized [xmin,ymin,w,h] in 0-1 (SAM3 box format),
+        or None if empty."""
+        ys, xs = np.where(mask)
+        if xs.size == 0:
+            return None
+        H, W = mask.shape
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        return [x0 / W, y0 / H, (x1 - x0 + 1) / W, (y1 - y0 + 1) / H]
+
+    @staticmethod
+    def _iou(a, b):
+        u = np.logical_or(a, b).sum()
+        return float(np.logical_and(a, b).sum()) / float(u) if u else 0.0
+
+    def _store_out(self, bout_masks, cam_idx, frame_idx, out, remap=None):
+        """Store one propagated frame's masks into bout_masks, optionally
+        remapping SAM3 obj_ids to canonical (chunk-consistent) ids. obj_ids
+        absent from `remap` are dropped (spurious re-detections)."""
+        if not out or 'out_obj_ids' not in out:
+            return
+        oids, masks = out['out_obj_ids'], out['out_binary_masks']
+        probs = out.get('out_probs', np.array([]))
+        keep_ids, keep_masks, keep_probs = [], [], []
+        for i, oid in enumerate(oids):
+            cid = int(oid) if remap is None else remap.get(int(oid))
+            if cid is None:
+                continue
+            keep_ids.append(cid)
+            keep_masks.append(np.asarray(masks[i]))
+            keep_probs.append(probs[i] if i < len(probs) else 0.0)
+        if keep_ids:
+            bout_masks.set_camera_masks(cam_idx, frame_idx, keep_ids,
+                                        np.stack(keep_masks),
+                                        np.asarray(keep_probs))
+
     def _process_bout_inner(self, video_paths, frame_start, num_frames,
                             num_animals, bout_masks, tmp_base):
         # Thread-local CUDA current device — belt-and-suspenders alongside
@@ -639,70 +688,153 @@ class SAM3VideoTracker:
         # so any sam3 internals that resolve torch.device("cuda") pick up
         # the right GPU.
         torch.cuda.set_device(self.gpu_id)
+        chunked = self.chunk_len and num_frames > self.chunk_len
         for cam_idx, video_path in enumerate(video_paths):
-            cam_name = os.path.splitext(
-                os.path.basename(video_path)
-            )[0]
-            cam_dir = os.path.join(tmp_base, cam_name)
+            cam_name = os.path.splitext(os.path.basename(video_path))[0]
+            if chunked:
+                self._track_camera_chunked(cam_idx, video_path, cam_name,
+                                           frame_start, num_frames, bout_masks, tmp_base)
+            else:
+                self._track_camera_single(cam_idx, video_path, cam_name,
+                                          frame_start, num_frames, bout_masks, tmp_base)
 
-            print(f"    Extracting frames for {cam_name}...")
-            self._extract_bout_frames(
-                video_path, frame_start, num_frames, cam_dir
-            )
+    def _track_camera_single(self, cam_idx, video_path, cam_name, frame_start,
+                             num_frames, bout_masks, tmp_base):
+        """Original single-pass per-camera tracking (whole bout in one session)."""
+        cam_dir = os.path.join(tmp_base, cam_name)
+        print(f"    Extracting frames for {cam_name}...")
+        self._extract_bout_frames(video_path, frame_start, num_frames, cam_dir)
 
-            start_req = {
-                'type': 'start_session',
-                'resource_path': cam_dir,
-            }
-            # SAM 3.1 multiplex keeps backbone/memory features in GPU
-            # memory for every propagated frame. On ~2000-frame bouts
-            # that pushes past a 48 GiB A6000. Push per-frame buffers
-            # to CPU RAM so VRAM stays bounded by the current frame.
+        start_req = {'type': 'start_session', 'resource_path': cam_dir}
+        if self.sam3_version == 'sam3.1':
+            start_req['offload_video_to_cpu'] = True
+        session_id = self.predictor.handle_request(start_req)['session_id']
+
+        response = self.predictor.handle_request({
+            'type': 'add_prompt', 'session_id': session_id,
+            'frame_index': 0, 'text': self.text_prompt})
+        outputs = response['outputs']
+        if outputs and 'out_obj_ids' in outputs:
+            self._store_out(bout_masks, cam_idx, 0, outputs)
+            print(f"    {cam_name}: {len(outputs['out_obj_ids'])} flies detected on frame 0")
+        else:
+            print(f"    {cam_name}: no detections on frame 0")
+
+        print(f"    {cam_name}: propagating masks...")
+        for response in self.predictor.handle_stream_request({
+                'type': 'propagate_in_video', 'session_id': session_id,
+                'propagation_direction': 'forward'}):
+            self._store_out(bout_masks, cam_idx, response['frame_index'], response['outputs'])
+
+        self.predictor.handle_request({'type': 'close_session', 'session_id': session_id})
+        print(f"    {cam_name}: done")
+
+    def _track_camera_chunked(self, cam_idx, video_path, cam_name, frame_start,
+                              num_frames, bout_masks, tmp_base):
+        """Chunked per-camera tracking for long bouts (bounds GPU memory).
+
+        Chunk 0 is text-prompted (detection); each later chunk is box-prompted
+        at its first (=boundary) frame with the previous chunk's object bboxes,
+        then its SAM3 obj_ids are matched back to the canonical ids by mask IoU
+        at the boundary. All frames are stored at GLOBAL bout indices with
+        canonical ids, so the resulting BoutMasks is identical in shape/semantics
+        to the single-pass path (assign_identities et al. are unchanged)."""
+        L, O = self.chunk_len, self.chunk_overlap
+        step = max(1, L - O)
+        starts = list(range(0, num_frames, step))
+        canonical_next = [0]                       # mutable counter for new ids
+
+        for ci, gs in enumerate(starts):
+            ge = min(gs + L, num_frames)
+            if ci > 0 and gs >= num_frames:
+                break
+            cdir = os.path.join(tmp_base, f"{cam_name}_c{ci}")
+            self._extract_bout_frames(video_path, frame_start + gs, ge - gs, cdir)
+            start_req = {'type': 'start_session', 'resource_path': cdir}
             if self.sam3_version == 'sam3.1':
                 start_req['offload_video_to_cpu'] = True
-            response = self.predictor.handle_request(start_req)
-            session_id = response['session_id']
+            sid = self.predictor.handle_request(start_req)['session_id']
 
-            response = self.predictor.handle_request({
-                'type': 'add_prompt',
-                'session_id': session_id,
-                'frame_index': 0,
-                'text': self.text_prompt,
-            })
-            outputs = response['outputs']
-            if outputs and 'out_obj_ids' in outputs:
-                bout_masks.set_camera_masks(
-                    cam_idx, 0,
-                    outputs['out_obj_ids'],
-                    outputs['out_binary_masks'],
-                    outputs.get('out_probs', np.array([])),
-                )
-                n_det = len(outputs['out_obj_ids'])
-                print(f"    {cam_name}: {n_det} flies detected on frame 0")
-            else:
-                print(f"    {cam_name}: no detections on frame 0")
-
-            print(f"    {cam_name}: propagating masks...")
-            for response in self.predictor.handle_stream_request({
-                'type': 'propagate_in_video',
-                'session_id': session_id,
-                'propagation_direction': 'forward',
-            }):
-                fi = response['frame_index']
-                out = response['outputs']
+            remap = {}
+            if ci == 0:
+                r = self.predictor.handle_request({
+                    'type': 'add_prompt', 'session_id': sid,
+                    'frame_index': 0, 'text': self.text_prompt})
+                out = r.get('outputs')
                 if out and 'out_obj_ids' in out:
-                    bout_masks.set_camera_masks(
-                        cam_idx, fi,
-                        out['out_obj_ids'],
-                        out['out_binary_masks'],
-                        out.get('out_probs', np.array([])),
-                    )
+                    for oid in out['out_obj_ids']:
+                        remap[int(oid)] = canonical_next[0]; canonical_next[0] += 1
+                    self._store_out(bout_masks, cam_idx, gs, out, remap)
+                    print(f"    {cam_name} chunk0[{gs}:{ge}]: {len(out['out_obj_ids'])} detected")
+                else:
+                    print(f"    {cam_name} chunk0[{gs}:{ge}]: no detections")
+            else:
+                # canonical object masks at/just-before the boundary frame gs
+                bnd = self._boundary_masks(bout_masks, cam_idx, gs, O)
+                boxes, canon = [], []
+                for cid, m in bnd.items():
+                    bb = self._mask_bbox_norm(m)
+                    if bb is not None:
+                        boxes.append(bb); canon.append(cid)
+                if not boxes:
+                    print(f"    {cam_name} chunk{ci}[{gs}:{ge}]: no boundary boxes -- skipping chunk")
+                    self.predictor.handle_request({'type': 'close_session', 'session_id': sid})
+                    shutil.rmtree(cdir, ignore_errors=True)
+                    continue
+                r = self.predictor.handle_request({
+                    'type': 'add_prompt', 'session_id': sid, 'frame_index': 0,
+                    'text': self.text_prompt,
+                    'bounding_boxes': boxes, 'bounding_box_labels': [1] * len(boxes)})
+                out = r.get('outputs')
+                remap = self._match_boundary(out, bnd)   # sam3 oid -> canonical id
+                self._store_out(bout_masks, cam_idx, gs, out, remap)
+                print(f"    {cam_name} chunk{ci}[{gs}:{ge}]: box-prompt {len(boxes)} -> "
+                      f"matched {len(remap)} objects")
 
-            self.predictor.handle_request({
-                'type': 'close_session',
-                'session_id': session_id,
-            })
-            print(f"    {cam_name}: done")
+            for resp in self.predictor.handle_stream_request({
+                    'type': 'propagate_in_video', 'session_id': sid,
+                    'propagation_direction': 'forward'}):
+                gf = gs + resp['frame_index']
+                if gf < num_frames:
+                    self._store_out(bout_masks, cam_idx, gf, resp['outputs'], remap)
+
+            self.predictor.handle_request({'type': 'close_session', 'session_id': sid})
+            shutil.rmtree(cdir, ignore_errors=True)
+            if ge >= num_frames:
+                break
+        print(f"    {cam_name}: done (chunked, {len(starts)} chunks)")
+
+    @staticmethod
+    def _boundary_masks(bout_masks, cam_idx, gs, overlap):
+        """Canonical {id: mask} for the boundary: each canonical object's most
+        recent mask in [gs-overlap, gs] (handles an object briefly missing on the
+        exact boundary frame)."""
+        out = {}
+        lo = max(0, gs - overlap)
+        for gf in range(gs, lo - 1, -1):                 # gs first, then backward
+            for cid, data in bout_masks.masks[cam_idx][gf].items():
+                if cid not in out:
+                    out[cid] = data['mask']
+        return out
+
+    def _match_boundary(self, out, bnd):
+        """Greedy IoU match of a box-prompted chunk's returned objects to the
+        canonical boundary objects. Returns {sam3_obj_id: canonical_id}; returned
+        objects matching no canonical (spurious text re-detections) are dropped."""
+        if not out or 'out_obj_ids' not in out:
+            return {}
+        pairs = []
+        for i, oid in enumerate(out['out_obj_ids']):
+            m = np.asarray(out['out_binary_masks'][i])
+            for cid, cm in bnd.items():
+                pairs.append((self._iou(m, cm), int(oid), cid))
+        pairs.sort(reverse=True)
+        remap, used_o, used_c = {}, set(), set()
+        for iou_v, oid, cid in pairs:
+            if iou_v <= 0.1 or oid in used_o or cid in used_c:
+                continue
+            remap[oid] = cid; used_o.add(oid); used_c.add(cid)
+        return remap
 
 
 class SAM3StreamingTracker:
