@@ -243,9 +243,27 @@ class BoutMasks:
                             min_sep = d
             return cams_ok, (min_sep if min_sep < float('inf') else 0.0)
 
-        scan_limit = min(self.num_frames, 200)
+        # Anchor candidates are sampled ACROSS THE WHOLE BOUT rather than
+        # taken from its first 200 frames. Same evaluation budget, far better
+        # coverage: on a 1393-frame bout the old window saw only the opening
+        # 14%, so if the animals happened to be poorly placed there the
+        # identity decision for the entire bout was made on weak evidence.
+        # Session0 bout 22 chose an anchor with cams_ok=2 -- two cameras, two
+        # objects each -- which leaves the residual enumeration nothing to
+        # discriminate with.
+        #
+        # NOTE what this does NOT do: the tracked object set per camera is
+        # fixed by the initial detection (detect_frame0 + propagation), so a
+        # later anchor cannot introduce an animal a camera never detected. It
+        # improves WHICH tracked objects map to which fly slot, not how many
+        # objects exist. Cameras that only ever saw one fly still only see one.
+        n_scan = min(self.num_frames, 200)
+        scan_frames = (np.unique(np.linspace(0, self.num_frames - 1, n_scan)
+                                 .astype(int)).tolist()
+                       if self.num_frames > 0 else [])
         ranked = []  # list of (cams_ok, min_sep, frame)
-        for f in range(scan_limit):
+        for f in scan_frames:
+            f = int(f)
             cams_ok, sep = _frame_separation(f)
             if cams_ok >= 2:  # need 2 cams for a triangulation
                 ranked.append((cams_ok, sep, f))
