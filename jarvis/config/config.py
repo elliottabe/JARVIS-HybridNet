@@ -101,6 +101,24 @@ _C.AUGMENTATION.COLOR_MANIPULATION.PER_CHANNEL_MULTIPLY.PER_CHANNEL_PROBABILITY 
 _C.AUGMENTATION.COLOR_MANIPULATION.PER_CHANNEL_MULTIPLY.SCALE = [0.8,1.2]
 _C.AUGMENTATION.MIRROR = CN()
 _C.AUGMENTATION.MIRROR.PROBABILITY = 0.0
+# CUTOUT / CROP_JITTER: declared here (unused by any code in this jarvis/
+# package -- grep confirms no reader) purely so yacs's strict merge_from_file
+# accepts project config.yaml files that set them (e.g.
+# projects/fly50_V6/config.yaml). Without this block, ProjectManager.load()
+# raises KeyError on ANY project whose config.yaml has these keys -- including
+# fly50_V6, the shipped CenterDetect checkpoint used as the default
+# multi-animal localizer -- so this fix is required just to load that
+# checkpoint at all, independent of anything else being measured.
+_C.AUGMENTATION.CUTOUT = CN()
+_C.AUGMENTATION.CUTOUT.ENABLED = False
+_C.AUGMENTATION.CUTOUT.NUM_PATCHES_MIN = 1
+_C.AUGMENTATION.CUTOUT.NUM_PATCHES_MAX = 3
+_C.AUGMENTATION.CUTOUT.PATCH_SIZE_MIN = 0.05
+_C.AUGMENTATION.CUTOUT.PATCH_SIZE_MAX = 0.15
+_C.AUGMENTATION.CROP_JITTER = CN()
+_C.AUGMENTATION.CROP_JITTER.ENABLED = False
+_C.AUGMENTATION.CROP_JITTER.MAX_PIXELS_X = 0
+_C.AUGMENTATION.CROP_JITTER.MAX_PIXELS_Y = 0
 _C.AUGMENTATION.AFFINE_TRANSFORM = CN()
 _C.AUGMENTATION.AFFINE_TRANSFORM.PROBABILITY = 0.5
 _C.AUGMENTATION.AFFINE_TRANSFORM.ROTATION_RANGE = [-45,45]
